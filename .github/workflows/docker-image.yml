@@ -26,7 +26,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v4
         with:
-          images: sunrisewestern/bilipod
+          images: sunrisewestern/vaultwarden
           tags: |
             type=raw,value=latest
             type=ref,event=tag
