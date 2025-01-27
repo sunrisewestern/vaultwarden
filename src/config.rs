@@ -1,6 +1,11 @@
-use std::env::consts::EXE_SUFFIX;
-use std::process::exit;
-use std::sync::RwLock;
+use std::{
+    env::consts::EXE_SUFFIX,
+    process::exit,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        RwLock,
+    },
+};
 
 use job_scheduler_ng::Schedule;
 use once_cell::sync::Lazy;
@@ -9,13 +14,15 @@ use reqwest::Url;
 use crate::{
     db::DbConnType,
     error::Error,
-    util::{get_env, get_env_bool, parse_experimental_client_feature_flags},
+    util::{get_env, get_env_bool, get_web_vault_version, is_valid_email, parse_experimental_client_feature_flags},
 };
 
 static CONFIG_FILE: Lazy<String> = Lazy::new(|| {
     let data_folder = get_env("DATA_FOLDER").unwrap_or_else(|| String::from("data"));
     get_env("CONFIG_FILE").unwrap_or_else(|| format!("{data_folder}/config.json"))
 });
+
+pub static SKIP_CONFIG_VALIDATION: AtomicBool = AtomicBool::new(false);
 
 pub static CONFIG: Lazy<Config> = Lazy::new(|| {
     Config::load().unwrap_or_else(|e| {
@@ -107,6 +114,14 @@ macro_rules! make_config {
                 let config_str = std::fs::read_to_string(path)?;
                 println!("[INFO] Using saved config from `{path}` for configuration.\n");
                 serde_json::from_str(&config_str).map_err(Into::into)
+            }
+
+            fn clear_non_editable(&mut self) {
+                $($(
+                    if !$editable {
+                        self.$name = None;
+                    }
+                )+)+
             }
 
             /// Merges the values of both builders into a new builder.
@@ -233,6 +248,7 @@ macro_rules! make_config {
                 // Besides Pass, only String types will be masked via _privacy_mask.
                 const PRIVACY_CONFIG: &[&str] = &[
                     "allowed_iframe_ancestors",
+                    "allowed_connect_src",
                     "database_url",
                     "domain_origin",
                     "domain_path",
@@ -243,6 +259,7 @@ macro_rules! make_config {
                     "smtp_from",
                     "smtp_host",
                     "smtp_username",
+                    "_smtp_img_src",
                 ];
 
                 let cfg = {
@@ -492,11 +509,11 @@ make_config! {
         /// Password iterations |> Number of server-side passwords hashing iterations for the password hash.
         /// The default for new users. If changed, it will be updated during login for existing users.
         password_iterations:    i32,    true,   def,    600_000;
-        /// Allow password hints |> Controls whether users can set password hints. This setting applies globally to all users.
+        /// Allow password hints |> Controls whether users can set or show password hints. This setting applies globally to all users.
         password_hints_allowed: bool,   true,   def,    true;
-        /// Show password hint |> Controls whether a password hint should be shown directly in the web page
-        /// if SMTP service is not configured. Not recommended for publicly-accessible instances as this
-        /// provides unauthenticated access to potentially sensitive data.
+        /// Show password hint (Know the risks!) |> Controls whether a password hint should be shown directly in the web page
+        /// if SMTP service is not configured and password hints are allowed. Not recommended for publicly-accessible instances
+        /// because this provides unauthenticated access to potentially sensitive data.
         show_password_hint:     bool,   true,   def,    false;
 
         /// Admin token/Argon2 PHC |> The plain text token or Argon2 PHC string used to authenticate in this very same page. Changing it here will not deauthorize the current session!
@@ -604,6 +621,9 @@ make_config! {
         /// Allowed iframe ancestors (Know the risks!) |> Allows other domains to embed the web vault into an iframe, useful for embedding into secure intranets
         allowed_iframe_ancestors: String, true, def,    String::new();
 
+        /// Allowed connect-src (Know the risks!) |> Allows other domains to URLs which can be loaded using script interfaces like the Forwarded email alias feature
+        allowed_connect_src:      String, true, def,    String::new();
+
         /// Seconds between login requests |> Number of seconds, on average, between login and 2FA requests from the same IP address before rate limiting kicks in
         login_ratelimit_seconds:       u64, false, def, 60;
         /// Max burst size for login requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `login_ratelimit_seconds`. Note that this applies to both the login and the 2FA, so it's recommended to allow a burst size of at least 2
@@ -667,7 +687,7 @@ make_config! {
         /// Use Sendmail |> Whether to send mail via the `sendmail` command
         use_sendmail:                  bool,   true,   def,     false;
         /// Sendmail Command |> Which sendmail command to use. The one found in the $PATH is used if not specified.
-        sendmail_command:              String, true,   option;
+        sendmail_command:              String, false,  option;
         /// Host
         smtp_host:                     String, true,   option;
         /// DEPRECATED smtp_ssl |> DEPRECATED - Please use SMTP_SECURITY
@@ -755,6 +775,13 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         );
     }
 
+    let connect_src = cfg.allowed_connect_src.to_lowercase();
+    for url in connect_src.split_whitespace() {
+        if !url.starts_with("https://") || Url::parse(url).is_err() {
+            err!("ALLOWED_CONNECT_SRC variable contains one or more invalid URLs. Only FQDN's starting with https are allowed");
+        }
+    }
+
     let whitelist = &cfg.signups_domains_whitelist;
     if !whitelist.is_empty() && whitelist.split(',').any(|d| d.trim().is_empty()) {
         err!("`SIGNUPS_DOMAINS_WHITELIST` contains empty tokens");
@@ -806,8 +833,16 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
     }
 
     // TODO: deal with deprecated flags so they can be removed from this list, cf. #4263
-    const KNOWN_FLAGS: &[&str] =
-        &["autofill-overlay", "autofill-v2", "browser-fileless-import", "fido2-vault-credentials"];
+    const KNOWN_FLAGS: &[&str] = &[
+        "autofill-overlay",
+        "autofill-v2",
+        "browser-fileless-import",
+        "extension-refresh",
+        "fido2-vault-credentials",
+        "inline-menu-positioning-improvements",
+        "ssh-key-vault-item",
+        "ssh-agent",
+    ];
     let configured_flags = parse_experimental_client_feature_flags(&cfg.experimental_client_feature_flags);
     let invalid_flags: Vec<_> = configured_flags.keys().filter(|flag| !KNOWN_FLAGS.contains(&flag.as_str())).collect();
     if !invalid_flags.is_empty() {
@@ -868,12 +903,12 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
             let command = cfg.sendmail_command.clone().unwrap_or_else(|| format!("sendmail{EXE_SUFFIX}"));
 
             let mut path = std::path::PathBuf::from(&command);
-
+            // Check if we can find the sendmail command to execute when no absolute path is given
             if !path.is_absolute() {
-                match which::which(&command) {
-                    Ok(result) => path = result,
-                    Err(_) => err!(format!("sendmail command {command:?} not found in $PATH")),
-                }
+                let Ok(which_path) = which::which(&command) else {
+                    err!(format!("sendmail command {command} not found in $PATH"))
+                };
+                path = which_path;
             }
 
             match path.metadata() {
@@ -907,8 +942,8 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
             }
         }
 
-        if (cfg.smtp_host.is_some() || cfg.use_sendmail) && !cfg.smtp_from.contains('@') {
-            err!("SMTP_FROM does not contain a mandatory @ sign")
+        if (cfg.smtp_host.is_some() || cfg.use_sendmail) && !is_valid_email(&cfg.smtp_from) {
+            err!(format!("SMTP_FROM '{}' is not a valid email address", cfg.smtp_from))
         }
 
         if cfg._enable_email_2fa && cfg.email_token_size < 6 {
@@ -1105,7 +1140,9 @@ impl Config {
 
         // Fill any missing with defaults
         let config = builder.build();
-        validate_config(&config)?;
+        if !SKIP_CONFIG_VALIDATION.load(Ordering::Relaxed) {
+            validate_config(&config)?;
+        }
 
         Ok(Config {
             inner: RwLock::new(Inner {
@@ -1119,12 +1156,17 @@ impl Config {
         })
     }
 
-    pub fn update_config(&self, other: ConfigBuilder) -> Result<(), Error> {
+    pub fn update_config(&self, other: ConfigBuilder, ignore_non_editable: bool) -> Result<(), Error> {
         // Remove default values
         //let builder = other.remove(&self.inner.read().unwrap()._env);
 
         // TODO: Remove values that are defaults, above only checks those set by env and not the defaults
-        let builder = other;
+        let mut builder = other;
+
+        // Remove values that are not editable
+        if ignore_non_editable {
+            builder.clear_non_editable();
+        }
 
         // Serialize now before we consume the builder
         let config_str = serde_json::to_string_pretty(&builder)?;
@@ -1159,7 +1201,7 @@ impl Config {
             let mut _overrides = Vec::new();
             usr.merge(&other, false, &mut _overrides)
         };
-        self.update_config(builder)
+        self.update_config(builder, false)
     }
 
     /// Tests whether an email's domain is allowed. A domain is allowed if it
@@ -1262,9 +1304,14 @@ impl Config {
             let hb = load_templates(CONFIG.templates_folder());
             hb.render(name, data).map_err(Into::into)
         } else {
-            let hb = &CONFIG.inner.read().unwrap().templates;
+            let hb = &self.inner.read().unwrap().templates;
             hb.render(name, data).map_err(Into::into)
         }
+    }
+
+    pub fn render_fallback_template<T: serde::ser::Serialize>(&self, name: &str, data: &T) -> Result<String, Error> {
+        let hb = &self.inner.read().unwrap().templates;
+        hb.render(&format!("fallback_{name}"), data).map_err(Into::into)
     }
 
     pub fn set_rocket_shutdown_handle(&self, handle: rocket::Shutdown) {
@@ -1295,6 +1342,8 @@ where
     // Register helpers
     hb.register_helper("case", Box::new(case_helper));
     hb.register_helper("to_json", Box::new(to_json));
+    hb.register_helper("webver", Box::new(webver));
+    hb.register_helper("vwver", Box::new(vwver));
 
     macro_rules! reg {
         ($name:expr) => {{
@@ -1304,6 +1353,11 @@ where
         ($name:expr, $ext:expr) => {{
             reg!($name);
             reg!(concat!($name, $ext));
+        }};
+        (@withfallback $name:expr) => {{
+            let template = include_str!(concat!("static/templates/", $name, ".hbs"));
+            hb.register_template_string($name, template).unwrap();
+            hb.register_template_string(concat!("fallback_", $name), template).unwrap();
         }};
     }
 
@@ -1348,6 +1402,9 @@ where
 
     reg!("404");
 
+    reg!(@withfallback "scss/vaultwarden.scss");
+    reg!("scss/user.vaultwarden.scss");
+
     // And then load user templates to overwrite the defaults
     // Use .hbs extension for the files
     // Templates get registered with their relative name
@@ -1390,3 +1447,42 @@ fn to_json<'reg, 'rc>(
     out.write(&json)?;
     Ok(())
 }
+
+// Configure the web-vault version as an integer so it can be used as a comparison smaller or greater then.
+// The default is based upon the version since this feature is added.
+static WEB_VAULT_VERSION: Lazy<semver::Version> = Lazy::new(|| {
+    let vault_version = get_web_vault_version();
+    // Use a single regex capture to extract version components
+    let re = regex::Regex::new(r"(\d{4})\.(\d{1,2})\.(\d{1,2})").unwrap();
+    re.captures(&vault_version)
+        .and_then(|c| {
+            (c.len() == 4).then(|| {
+                format!("{}.{}.{}", c.get(1).unwrap().as_str(), c.get(2).unwrap().as_str(), c.get(3).unwrap().as_str())
+            })
+        })
+        .and_then(|v| semver::Version::parse(&v).ok())
+        .unwrap_or_else(|| semver::Version::parse("2024.6.2").unwrap())
+});
+
+// Configure the Vaultwarden version as an integer so it can be used as a comparison smaller or greater then.
+// The default is based upon the version since this feature is added.
+static VW_VERSION: Lazy<semver::Version> = Lazy::new(|| {
+    let vw_version = crate::VERSION.unwrap_or("1.32.5");
+    // Use a single regex capture to extract version components
+    let re = regex::Regex::new(r"(\d{1})\.(\d{1,2})\.(\d{1,2})").unwrap();
+    re.captures(vw_version)
+        .and_then(|c| {
+            (c.len() == 4).then(|| {
+                format!("{}.{}.{}", c.get(1).unwrap().as_str(), c.get(2).unwrap().as_str(), c.get(3).unwrap().as_str())
+            })
+        })
+        .and_then(|v| semver::Version::parse(&v).ok())
+        .unwrap_or_else(|| semver::Version::parse("1.32.5").unwrap())
+});
+
+handlebars::handlebars_helper!(webver: | web_vault_version: String |
+    semver::VersionReq::parse(&web_vault_version).expect("Invalid web-vault version compare string").matches(&WEB_VAULT_VERSION)
+);
+handlebars::handlebars_helper!(vwver: | vw_version: String |
+    semver::VersionReq::parse(&vw_version).expect("Invalid Vaultwarden version compare string").matches(&VW_VERSION)
+);
