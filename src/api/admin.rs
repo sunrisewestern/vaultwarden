@@ -46,6 +46,7 @@ pub fn routes() -> Vec<Route> {
         invite_user,
         logout,
         delete_user,
+        delete_sso_user,
         deauth_user,
         disable_user,
         enable_user,
@@ -102,7 +103,7 @@ const ACTING_ADMIN_USER: &str = "vaultwarden-admin-00000-000000000000";
 pub const FAKE_ADMIN_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 fn admin_path() -> String {
-    format!("{}{}", CONFIG.domain_path(), ADMIN_PATH)
+    format!("{}{ADMIN_PATH}", CONFIG.domain_path())
 }
 
 #[derive(Debug)]
@@ -206,7 +207,7 @@ fn post_admin_login(
 
         cookies.add(cookie);
         if let Some(redirect) = redirect {
-            Ok(Redirect::to(format!("{}{}", admin_path(), redirect)))
+            Ok(Redirect::to(format!("{}{redirect}", admin_path())))
         } else {
             Err(AdminResponse::Ok(render_admin_page()))
         }
@@ -239,6 +240,7 @@ struct AdminTemplateData {
     page_data: Option<Value>,
     logged_in: bool,
     urlpath: String,
+    sso_enabled: bool,
 }
 
 impl AdminTemplateData {
@@ -248,6 +250,7 @@ impl AdminTemplateData {
             page_data: Some(page_data),
             logged_in: true,
             urlpath: CONFIG.domain_path(),
+            sso_enabled: CONFIG.sso_enabled(),
         }
     }
 
@@ -296,7 +299,7 @@ async fn invite_user(data: Json<InviteData>, _token: AdminToken, mut conn: DbCon
         err_code!("User already exists", Status::Conflict.code)
     }
 
-    let mut user = User::new(data.email);
+    let mut user = User::new(data.email, None);
 
     async fn _generate_invite(user: &User, conn: &mut DbConn) -> EmptyResult {
         if CONFIG.mail_enabled() {
@@ -336,7 +339,7 @@ fn logout(cookies: &CookieJar<'_>) -> Redirect {
 async fn get_users_json(_token: AdminToken, mut conn: DbConn) -> Json<Value> {
     let users = User::get_all(&mut conn).await;
     let mut users_json = Vec::with_capacity(users.len());
-    for u in users {
+    for (u, _) in users {
         let mut usr = u.to_json(&mut conn).await;
         usr["userEnabled"] = json!(u.enabled);
         usr["createdAt"] = json!(format_naive_datetime_local(&u.created_at, DT_FMT));
@@ -354,7 +357,7 @@ async fn get_users_json(_token: AdminToken, mut conn: DbConn) -> Json<Value> {
 async fn users_overview(_token: AdminToken, mut conn: DbConn) -> ApiResult<Html<String>> {
     let users = User::get_all(&mut conn).await;
     let mut users_json = Vec::with_capacity(users.len());
-    for u in users {
+    for (u, sso_u) in users {
         let mut usr = u.to_json(&mut conn).await;
         usr["cipher_count"] = json!(Cipher::count_owned_by_user(&u.uuid, &mut conn).await);
         usr["attachment_count"] = json!(Attachment::count_by_user(&u.uuid, &mut conn).await);
@@ -365,6 +368,9 @@ async fn users_overview(_token: AdminToken, mut conn: DbConn) -> ApiResult<Html<
             Some(dt) => json!(format_naive_datetime_local(&dt, DT_FMT)),
             None => json!("Never"),
         };
+
+        usr["sso_identifier"] = json!(sso_u.map(|u| u.identifier.to_string()).unwrap_or(String::new()));
+
         users_json.push(usr);
     }
 
@@ -403,7 +409,28 @@ async fn delete_user(user_id: UserId, token: AdminToken, mut conn: DbConn) -> Em
 
     for membership in memberships {
         log_event(
-            EventType::OrganizationUserRemoved as i32,
+            EventType::OrganizationUserDeleted as i32,
+            &membership.uuid,
+            &membership.org_uuid,
+            &ACTING_ADMIN_USER.into(),
+            14, // Use UnknownBrowser type
+            &token.ip.ip,
+            &mut conn,
+        )
+        .await;
+    }
+
+    res
+}
+
+#[delete("/users/<user_id>/sso", format = "application/json")]
+async fn delete_sso_user(user_id: UserId, token: AdminToken, mut conn: DbConn) -> EmptyResult {
+    let memberships = Membership::find_any_state_by_user(&user_id, &mut conn).await;
+    let res = SsoUser::delete(&user_id, &mut conn).await;
+
+    for membership in memberships {
+        log_event(
+            EventType::OrganizationUserUnlinkedSso as i32,
             &membership.uuid,
             &membership.org_uuid,
             &ACTING_ADMIN_USER.into(),
@@ -421,13 +448,13 @@ async fn delete_user(user_id: UserId, token: AdminToken, mut conn: DbConn) -> Em
 async fn deauth_user(user_id: UserId, _token: AdminToken, mut conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     let mut user = get_user_or_404(&user_id, &mut conn).await?;
 
-    nt.send_logout(&user, None).await;
+    nt.send_logout(&user, None, &mut conn).await;
 
     if CONFIG.push_enabled() {
         for device in Device::find_push_devices_by_user(&user.uuid, &mut conn).await {
-            match unregister_push_device(device.push_uuid).await {
+            match unregister_push_device(&device.push_uuid).await {
                 Ok(r) => r,
-                Err(e) => error!("Unable to unregister devices from Bitwarden server: {}", e),
+                Err(e) => error!("Unable to unregister devices from Bitwarden server: {e}"),
             };
         }
     }
@@ -447,7 +474,7 @@ async fn disable_user(user_id: UserId, _token: AdminToken, mut conn: DbConn, nt:
 
     let save_result = user.save(&mut conn).await;
 
-    nt.send_logout(&user, None).await;
+    nt.send_logout(&user, None, &mut conn).await;
 
     save_result
 }
@@ -591,18 +618,12 @@ struct GitCommit {
     sha: String,
 }
 
-#[derive(Deserialize)]
-struct TimeApi {
-    year: u16,
-    month: u8,
-    day: u8,
-    hour: u8,
-    minute: u8,
-    seconds: u8,
-}
-
 async fn get_json_api<T: DeserializeOwned>(url: &str) -> Result<T, Error> {
     Ok(make_http_request(Method::GET, url)?.send().await?.error_for_status()?.json::<T>().await?)
+}
+
+async fn get_text_api(url: &str) -> Result<String, Error> {
+    Ok(make_http_request(Method::GET, url)?.send().await?.error_for_status()?.text().await?)
 }
 
 async fn has_http_access() -> bool {
@@ -616,10 +637,12 @@ async fn has_http_access() -> bool {
 }
 
 use cached::proc_macro::cached;
-/// Cache this function to prevent API call rate limit. Github only allows 60 requests per hour, and we use 3 here already.
-/// It will cache this function for 300 seconds (5 minutes) which should prevent the exhaustion of the rate limit.
-#[cached(time = 300, sync_writes = true)]
-async fn get_release_info(has_http_access: bool, running_within_container: bool) -> (String, String, String) {
+/// Cache this function to prevent API call rate limit. Github only allows 60 requests per hour, and we use 3 here already
+/// It will cache this function for 600 seconds (10 minutes) which should prevent the exhaustion of the rate limit
+/// Any cache will be lost if Vaultwarden is restarted
+use std::time::Duration; // Needed for cached
+#[cached(time = 600, sync_writes = "default")]
+async fn get_release_info(has_http_access: bool) -> (String, String, String) {
     // If the HTTP Check failed, do not even attempt to check for new versions since we were not able to connect with github.com anyway.
     if has_http_access {
         (
@@ -636,19 +659,13 @@ async fn get_release_info(has_http_access: bool, running_within_container: bool)
                 }
                 _ => "-".to_string(),
             },
-            // Do not fetch the web-vault version when running within a container.
+            // Do not fetch the web-vault version when running within a container
             // The web-vault version is embedded within the container it self, and should not be updated manually
-            if running_within_container {
-                "-".to_string()
-            } else {
-                match get_json_api::<GitRelease>(
-                    "https://api.github.com/repos/dani-garcia/bw_web_builds/releases/latest",
-                )
+            match get_json_api::<GitRelease>("https://api.github.com/repos/dani-garcia/bw_web_builds/releases/latest")
                 .await
-                {
-                    Ok(r) => r.tag_name.trim_start_matches('v').to_string(),
-                    _ => "-".to_string(),
-                }
+            {
+                Ok(r) => r.tag_name.trim_start_matches('v').to_string(),
+                _ => "-".to_string(),
             },
         )
     } else {
@@ -658,17 +675,18 @@ async fn get_release_info(has_http_access: bool, running_within_container: bool)
 
 async fn get_ntp_time(has_http_access: bool) -> String {
     if has_http_access {
-        if let Ok(ntp_time) = get_json_api::<TimeApi>("https://www.timeapi.io/api/Time/current/zone?timeZone=UTC").await
-        {
-            return format!(
-                "{year}-{month:02}-{day:02} {hour:02}:{minute:02}:{seconds:02} UTC",
-                year = ntp_time.year,
-                month = ntp_time.month,
-                day = ntp_time.day,
-                hour = ntp_time.hour,
-                minute = ntp_time.minute,
-                seconds = ntp_time.seconds
-            );
+        if let Ok(cf_trace) = get_text_api("https://cloudflare.com/cdn-cgi/trace").await {
+            for line in cf_trace.lines() {
+                if let Some((key, value)) = line.split_once('=') {
+                    if key == "ts" {
+                        let ts = value.split_once('.').map_or(value, |(s, _)| s);
+                        if let Ok(dt) = chrono::DateTime::parse_from_str(ts, "%s") {
+                            return dt.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
     String::from("Unable to fetch NTP time.")
@@ -693,13 +711,22 @@ async fn diagnostics(_token: AdminToken, ip_header: IpHeader, mut conn: DbConn) 
         _ => "Unable to resolve domain name.".to_string(),
     };
 
-    let (latest_release, latest_commit, latest_web_build) =
-        get_release_info(has_http_access, running_within_container).await;
+    let (latest_release, latest_commit, latest_web_build) = get_release_info(has_http_access).await;
 
     let ip_header_name = &ip_header.0.unwrap_or_default();
 
     // Get current running versions
     let web_vault_version = get_web_vault_version();
+
+    // Check if the running version is newer than the latest stable released version
+    let web_vault_pre_release = if let Ok(web_ver_match) = semver::VersionReq::parse(&format!(">{latest_web_build}")) {
+        web_ver_match.matches(
+            &semver::Version::parse(&web_vault_version).unwrap_or_else(|_| semver::Version::parse("2025.1.1").unwrap()),
+        )
+    } else {
+        error!("Unable to parse latest_web_build: '{latest_web_build}'");
+        false
+    };
 
     let diagnostics_json = json!({
         "dns_resolved": dns_resolved,
@@ -709,6 +736,7 @@ async fn diagnostics(_token: AdminToken, ip_header: IpHeader, mut conn: DbConn) 
         "web_vault_enabled": &CONFIG.web_vault_enabled(),
         "web_vault_version": web_vault_version,
         "latest_web_build": latest_web_build,
+        "web_vault_pre_release": web_vault_pre_release,
         "running_within_container": running_within_container,
         "container_base_image": if running_within_container { container_base_image() } else { "Not applicable" },
         "has_http_access": has_http_access,
@@ -724,6 +752,7 @@ async fn diagnostics(_token: AdminToken, ip_header: IpHeader, mut conn: DbConn) 
         "overrides": &CONFIG.get_overrides().join(", "),
         "host_arch": env::consts::ARCH,
         "host_os":  env::consts::OS,
+        "tz_env": env::var("TZ").unwrap_or_default(),
         "server_time_local": Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string(),
         "server_time": Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(), // Run the server date/time check as late as possible to minimize the time difference
         "ntp_time": get_ntp_time(has_http_access).await, // Run the ntp check as late as possible to minimize the time difference
@@ -745,17 +774,17 @@ fn get_diagnostics_http(code: u16, _token: AdminToken) -> EmptyResult {
 }
 
 #[post("/config", format = "application/json", data = "<data>")]
-fn post_config(data: Json<ConfigBuilder>, _token: AdminToken) -> EmptyResult {
+async fn post_config(data: Json<ConfigBuilder>, _token: AdminToken) -> EmptyResult {
     let data: ConfigBuilder = data.into_inner();
-    if let Err(e) = CONFIG.update_config(data, true) {
+    if let Err(e) = CONFIG.update_config(data, true).await {
         err!(format!("Unable to save config: {e:?}"))
     }
     Ok(())
 }
 
 #[post("/config/delete", format = "application/json")]
-fn delete_config(_token: AdminToken) -> EmptyResult {
-    if let Err(e) = CONFIG.delete_user_config() {
+async fn delete_config(_token: AdminToken) -> EmptyResult {
+    if let Err(e) = CONFIG.delete_user_config().await {
         err!(format!("Unable to delete config: {e:?}"))
     }
     Ok(())

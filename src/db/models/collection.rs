@@ -11,6 +11,7 @@ use macros::UuidFromParam;
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
     #[diesel(table_name = collections)]
+    #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid))]
     pub struct Collection {
         pub uuid: CollectionId,
@@ -96,13 +97,13 @@ impl Collection {
                         (
                             cu.read_only,
                             cu.hide_passwords,
-                            cu.manage || (is_manager && !cu.read_only && !cu.hide_passwords),
+                            is_manager && (cu.manage || (!cu.read_only && !cu.hide_passwords)),
                         )
                     } else if let Some(cg) = cipher_sync_data.user_collections_groups.get(&self.uuid) {
                         (
                             cg.read_only,
                             cg.hide_passwords,
-                            cg.manage || (is_manager && !cg.read_only && !cg.hide_passwords),
+                            is_manager && (cg.manage || (!cg.read_only && !cg.hide_passwords)),
                         )
                     } else {
                         (false, false, false)
@@ -113,7 +114,9 @@ impl Collection {
         } else {
             match Membership::find_confirmed_by_user_and_org(user_uuid, &self.org_uuid, conn).await {
                 Some(m) if m.has_full_access() => (false, false, m.atype >= MembershipType::Manager),
-                Some(_) if self.is_manageable_by_user(user_uuid, conn).await => (false, false, true),
+                Some(m) if m.atype == MembershipType::Manager && self.is_manageable_by_user(user_uuid, conn).await => {
+                    (false, false, true)
+                }
                 Some(m) => {
                     let is_manager = m.atype == MembershipType::Manager;
                     let read_only = !self.is_writable_by_user(user_uuid, conn).await;
@@ -589,6 +592,7 @@ impl CollectionUser {
                 .inner_join(collections::table.on(collections::uuid.eq(users_collections::collection_uuid)))
                 .filter(collections::org_uuid.eq(org_uuid))
                 .inner_join(users_organizations::table.on(users_organizations::user_uuid.eq(users_collections::user_uuid)))
+                .filter(users_organizations::org_uuid.eq(org_uuid))
                 .select((users_organizations::uuid, users_collections::collection_uuid, users_collections::read_only, users_collections::hide_passwords, users_collections::manage))
                 .load::<CollectionUserDb>(conn)
                 .expect("Error loading users_collections")
@@ -685,13 +689,15 @@ impl CollectionUser {
         }}
     }
 
-    pub async fn find_by_collection_swap_user_uuid_with_member_uuid(
+    pub async fn find_by_org_and_coll_swap_user_uuid_with_member_uuid(
+        org_uuid: &OrganizationId,
         collection_uuid: &CollectionId,
         conn: &mut DbConn,
     ) -> Vec<CollectionMembership> {
         let col_users = db_run! { conn: {
             users_collections::table
                 .filter(users_collections::collection_uuid.eq(collection_uuid))
+                .filter(users_organizations::org_uuid.eq(org_uuid))
                 .inner_join(users_organizations::table.on(users_organizations::user_uuid.eq(users_collections::user_uuid)))
                 .select((users_organizations::uuid, users_collections::collection_uuid, users_collections::read_only, users_collections::hide_passwords, users_collections::manage))
                 .load::<CollectionUserDb>(conn)

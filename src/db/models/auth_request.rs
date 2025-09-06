@@ -6,7 +6,7 @@ use macros::UuidFromParam;
 use serde_json::Value;
 
 db_object! {
-    #[derive(Debug, Identifiable, Queryable, Insertable, AsChangeset, Deserialize, Serialize)]
+    #[derive(Identifiable, Queryable, Insertable, AsChangeset, Deserialize, Serialize)]
     #[diesel(table_name = auth_requests)]
     #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid))]
@@ -16,7 +16,7 @@ db_object! {
         pub organization_uuid: Option<OrganizationId>,
 
         pub request_device_identifier: DeviceId,
-        pub device_type: i32,  // https://github.com/bitwarden/server/blob/master/src/Core/Enums/DeviceType.cs
+        pub device_type: i32,  // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/Enums/DeviceType.cs
 
         pub request_ip: String,
         pub response_device_id: Option<DeviceId>,
@@ -150,6 +150,7 @@ impl AuthRequest {
             auth_requests::table
                 .filter(auth_requests::user_uuid.eq(user_uuid))
                 .filter(auth_requests::request_device_identifier.eq(device_uuid))
+                .filter(auth_requests::approved.is_null())
                 .order_by(auth_requests::creation_date.desc())
                 .first::<AuthRequestDb>(conn).ok().from_db()
         }}

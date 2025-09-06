@@ -10,6 +10,7 @@ use serde_json::Value;
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
     #[diesel(table_name = groups)]
+    #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid))]
     pub struct Group {
         pub uuid: GroupId,
@@ -67,16 +68,11 @@ impl Group {
     }
 
     pub fn to_json(&self) -> Value {
-        use crate::util::format_date;
-
         json!({
             "id": self.uuid,
             "organizationId": self.organizations_uuid,
             "name": self.name,
-            "accessAll": self.access_all,
             "externalId": self.external_id,
-            "creationDate": format_date(&self.creation_date),
-            "revisionDate": format_date(&self.revision_date),
             "object": "group"
         })
     }
@@ -139,7 +135,7 @@ impl CollectionGroup {
         // If both read_only and hide_passwords are false, then manage should be true
         // You can't have an entry with read_only and manage, or hide_passwords and manage
         // Or an entry with everything to false
-        // For backwards compaibility and migration proposes we keep checking read_only and hide_password
+        // For backwards compatibility and migration proposes we keep checking read_only and hide_password
         json!({
             "id": self.groups_uuid,
             "readOnly": self.read_only,
@@ -297,7 +293,7 @@ impl Group {
 
     pub async fn update_revision(uuid: &GroupId, conn: &mut DbConn) {
         if let Err(e) = Self::_update_revision(uuid, &Utc::now().naive_utc(), conn).await {
-            warn!("Failed to update revision for {}: {:#?}", uuid, e);
+            warn!("Failed to update revision for {uuid}: {e:#?}");
         }
     }
 

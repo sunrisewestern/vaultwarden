@@ -8,11 +8,12 @@ use crate::{api::EmptyResult, db::DbConn, error::MapResult, CONFIG};
 // https://bitwarden.com/help/event-logs/
 
 db_object! {
-    // Upstream: https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Core/Services/Implementations/EventService.cs
-    // Upstream: https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Api/Models/Public/Response/EventResponseModel.cs
-    // Upstream SQL: https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Sql/dbo/Tables/Event.sql
+    // Upstream: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Services/Implementations/EventService.cs
+    // Upstream: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Public/Models/Response/EventResponseModel.cs
+    // Upstream SQL: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Sql/dbo/Tables/Event.sql
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
     #[diesel(table_name = event)]
+    #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid))]
     pub struct Event {
         pub uuid: EventId,
@@ -24,7 +25,7 @@ db_object! {
         pub group_uuid: Option<GroupId>,
         pub org_user_uuid: Option<MembershipId>,
         pub act_user_uuid: Option<UserId>,
-        // Upstream enum: https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Core/Enums/DeviceType.cs
+        // Upstream enum: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/Enums/DeviceType.cs
         pub device_type: Option<i32>,
         pub ip_address: Option<String>,
         pub event_date: NaiveDateTime,
@@ -35,7 +36,7 @@ db_object! {
     }
 }
 
-// Upstream enum: https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Core/Enums/EventType.cs
+// Upstream enum: https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Enums/EventType.cs
 #[derive(Debug, Copy, Clone)]
 pub enum EventType {
     // User
@@ -49,6 +50,8 @@ pub enum EventType {
     UserClientExportedVault = 1007,
     // UserUpdatedTempPassword = 1008, // Not supported
     // UserMigratedKeyToKeyConnector = 1009, // Not supported
+    UserRequestedDeviceApproval = 1010,
+    // UserTdeOffboardingPasswordSet = 1011, // Not supported
 
     // Cipher
     CipherCreated = 1100,
@@ -84,9 +87,9 @@ pub enum EventType {
     OrganizationUserInvited = 1500,
     OrganizationUserConfirmed = 1501,
     OrganizationUserUpdated = 1502,
-    OrganizationUserRemoved = 1503,
+    OrganizationUserRemoved = 1503, // Organization user data was deleted
     OrganizationUserUpdatedGroups = 1504,
-    // OrganizationUserUnlinkedSso = 1505, // Not supported
+    OrganizationUserUnlinkedSso = 1505,
     OrganizationUserResetPasswordEnroll = 1506,
     OrganizationUserResetPasswordWithdraw = 1507,
     OrganizationUserAdminResetPassword = 1508,
@@ -94,6 +97,10 @@ pub enum EventType {
     // OrganizationUserFirstSsoLogin = 1510, // Not supported
     OrganizationUserRevoked = 1511,
     OrganizationUserRestored = 1512,
+    OrganizationUserApprovedAuthRequest = 1513,
+    OrganizationUserRejectedAuthRequest = 1514,
+    OrganizationUserDeleted = 1515, // Both user and organization user data were deleted
+    OrganizationUserLeft = 1516,    // User voluntarily left the organization
 
     // Organization
     OrganizationUpdated = 1600,
@@ -105,6 +112,7 @@ pub enum EventType {
     // OrganizationEnabledKeyConnector = 1606, // Not supported
     // OrganizationDisabledKeyConnector = 1607, // Not supported
     // OrganizationSponsorshipsSynced = 1608, // Not supported
+    // OrganizationCollectionManagementUpdated = 1609, // Not supported
 
     // Policy
     PolicyUpdated = 1700,
@@ -117,6 +125,13 @@ pub enum EventType {
     // ProviderOrganizationAdded = 1901, // Not supported
     // ProviderOrganizationRemoved = 1902, // Not supported
     // ProviderOrganizationVaultAccessed = 1903, // Not supported
+
+    // OrganizationDomainAdded = 2000, // Not supported
+    // OrganizationDomainRemoved = 2001, // Not supported
+    // OrganizationDomainVerified = 2002, // Not supported
+    // OrganizationDomainNotVerified = 2003, // Not supported
+
+    // SecretRetrieved = 2100, // Not supported
 }
 
 /// Local methods
@@ -172,7 +187,7 @@ impl Event {
 }
 
 /// Database methods
-/// https://github.com/bitwarden/server/blob/8a22c0479e987e756ce7412c48a732f9002f0a2d/src/Core/Services/Implementations/EventService.cs
+/// https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Services/Implementations/EventService.cs
 impl Event {
     pub const PAGE_SIZE: i64 = 30;
 

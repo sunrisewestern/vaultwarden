@@ -46,7 +46,7 @@ struct OrgImportData {
 #[post("/public/organization/import", data = "<data>")]
 async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, mut conn: DbConn) -> EmptyResult {
     // Most of the logic for this function can be found here
-    // https://github.com/bitwarden/server/blob/fd892b2ff4547648a276734fb2b14a8abae2c6f5/src/Core/Services/Implementations/OrganizationService.cs#L1797
+    // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Services/Implementations/OrganizationService.cs#L1203
 
     let org_id = token.0;
     let data = data.into_inner();
@@ -89,7 +89,7 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, mut conn: Db
                 Some(user) => user, // exists in vaultwarden
                 None => {
                     // User does not exist yet
-                    let mut new_user = User::new(user_data.email.clone());
+                    let mut new_user = User::new(user_data.email.clone(), None);
                     new_user.save(&mut conn).await?;
 
                     if !CONFIG.mail_enabled() {
@@ -105,7 +105,12 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, mut conn: Db
                 MembershipStatus::Accepted as i32 // Automatically mark user as accepted if no email invites
             };
 
-            let mut new_member = Membership::new(user.uuid.clone(), org_id.clone());
+            let (org_name, org_email) = match Organization::find_by_uuid(&org_id, &mut conn).await {
+                Some(org) => (org.name, org.billing_email),
+                None => err!("Error looking up organization"),
+            };
+
+            let mut new_member = Membership::new(user.uuid.clone(), org_id.clone(), Some(org_email.clone()));
             new_member.set_external_id(Some(user_data.external_id.clone()));
             new_member.access_all = false;
             new_member.atype = MembershipType::User as i32;
@@ -114,11 +119,6 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, mut conn: Db
             new_member.save(&mut conn).await?;
 
             if CONFIG.mail_enabled() {
-                let (org_name, org_email) = match Organization::find_by_uuid(&org_id, &mut conn).await {
-                    Some(org) => (org.name, org.billing_email),
-                    None => err!("Error looking up organization"),
-                };
-
                 if let Err(e) =
                     mail::send_invite(&user, org_id.clone(), new_member.uuid.clone(), &org_name, Some(org_email)).await
                 {

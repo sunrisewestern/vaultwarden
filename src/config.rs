@@ -3,7 +3,7 @@ use std::{
     process::exit,
     sync::{
         atomic::{AtomicBool, Ordering},
-        RwLock,
+        LazyLock, RwLock,
     },
 };
 
@@ -22,10 +22,32 @@ static CONFIG_FILE: Lazy<String> = Lazy::new(|| {
     get_env("CONFIG_FILE").unwrap_or_else(|| format!("{data_folder}/config.json"))
 });
 
+static CONFIG_FILE_PARENT_DIR: LazyLock<String> = LazyLock::new(|| {
+    let path = std::path::PathBuf::from(&*CONFIG_FILE);
+    path.parent().unwrap_or(std::path::Path::new("data")).to_str().unwrap_or("data").to_string()
+});
+
+static CONFIG_FILENAME: LazyLock<String> = LazyLock::new(|| {
+    let path = std::path::PathBuf::from(&*CONFIG_FILE);
+    path.file_name().unwrap_or(std::ffi::OsStr::new("config.json")).to_str().unwrap_or("config.json").to_string()
+});
+
 pub static SKIP_CONFIG_VALIDATION: AtomicBool = AtomicBool::new(false);
 
 pub static CONFIG: Lazy<Config> = Lazy::new(|| {
-    Config::load().unwrap_or_else(|e| {
+    std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap_or_else(|e| {
+            println!("Error loading config:\n  {e:?}\n");
+            exit(12)
+        });
+
+        rt.block_on(Config::load()).unwrap_or_else(|e| {
+            println!("Error loading config:\n  {e:?}\n");
+            exit(12)
+        })
+    })
+    .join()
+    .unwrap_or_else(|e| {
         println!("Error loading config:\n  {e:?}\n");
         exit(12)
     })
@@ -104,16 +126,17 @@ macro_rules! make_config {
 
                 let mut builder = ConfigBuilder::default();
                 $($(
-                    builder.$name = make_config! { @getenv paste::paste!(stringify!([<$name:upper>])), $ty };
+                    builder.$name = make_config! { @getenv pastey::paste!(stringify!([<$name:upper>])), $ty };
                 )+)+
 
                 builder
             }
 
-            fn from_file(path: &str) -> Result<Self, Error> {
-                let config_str = std::fs::read_to_string(path)?;
-                println!("[INFO] Using saved config from `{path}` for configuration.\n");
-                serde_json::from_str(&config_str).map_err(Into::into)
+            async fn from_file() -> Result<Self, Error> {
+                let operator = opendal_operator_for_path(&CONFIG_FILE_PARENT_DIR)?;
+                let config_bytes = operator.read(&CONFIG_FILENAME).await?;
+                println!("[INFO] Using saved config from `{}` for configuration.\n", *CONFIG_FILE);
+                serde_json::from_slice(&config_bytes.to_vec()).map_err(Into::into)
             }
 
             fn clear_non_editable(&mut self) {
@@ -133,7 +156,7 @@ macro_rules! make_config {
                         builder.$name = v.clone();
 
                         if self.$name.is_some() {
-                            overrides.push(paste::paste!(stringify!([<$name:upper>])).into());
+                            overrides.push(pastey::paste!(stringify!([<$name:upper>])).into());
                         }
                     }
                 )+)+
@@ -231,7 +254,7 @@ macro_rules! make_config {
                                 element.insert("default".into(), serde_json::to_value(def.$name).unwrap());
                                 element.insert("type".into(), (_get_form_type(stringify!($ty))).into());
                                 element.insert("doc".into(), (_get_doc(concat!($($doc),+))).into());
-                                element.insert("overridden".into(), (overridden.contains(&paste::paste!(stringify!([<$name:upper>])).into())).into());
+                                element.insert("overridden".into(), (overridden.contains(&pastey::paste!(stringify!([<$name:upper>])).into())).into());
                                 element
                             }),
                         )+
@@ -260,6 +283,9 @@ macro_rules! make_config {
                     "smtp_host",
                     "smtp_username",
                     "_smtp_img_src",
+                    "sso_client_id",
+                    "sso_authority",
+                    "sso_callback_path",
                 ];
 
                 let cfg = {
@@ -375,19 +401,19 @@ make_config! {
         ///  Data folder |> Main data folder
         data_folder:            String, false,  def,    "data".to_string();
         /// Database URL
-        database_url:           String, false,  auto,   |c| format!("{}/{}", c.data_folder, "db.sqlite3");
+        database_url:           String, false,  auto,   |c| format!("{}/db.sqlite3", c.data_folder);
         /// Icon cache folder
-        icon_cache_folder:      String, false,  auto,   |c| format!("{}/{}", c.data_folder, "icon_cache");
+        icon_cache_folder:      String, false,  auto,   |c| format!("{}/icon_cache", c.data_folder);
         /// Attachments folder
-        attachments_folder:     String, false,  auto,   |c| format!("{}/{}", c.data_folder, "attachments");
+        attachments_folder:     String, false,  auto,   |c| format!("{}/attachments", c.data_folder);
         /// Sends folder
-        sends_folder:           String, false,  auto,   |c| format!("{}/{}", c.data_folder, "sends");
+        sends_folder:           String, false,  auto,   |c| format!("{}/sends", c.data_folder);
         /// Temp folder |> Used for storing temporary file uploads
-        tmp_folder:             String, false,  auto,   |c| format!("{}/{}", c.data_folder, "tmp");
+        tmp_folder:             String, false,  auto,   |c| format!("{}/tmp", c.data_folder);
         /// Templates folder
-        templates_folder:       String, false,  auto,   |c| format!("{}/{}", c.data_folder, "templates");
+        templates_folder:       String, false,  auto,   |c| format!("{}/templates", c.data_folder);
         /// Session JWT key
-        rsa_key_filename:       String, false,  auto,   |c| format!("{}/{}", c.data_folder, "rsa_key");
+        rsa_key_filename:       String, false,  auto,   |c| format!("{}/rsa_key", c.data_folder);
         /// Web vault folder
         web_vault_folder:       String, false,  def,    "web-vault/".to_string();
     },
@@ -435,6 +461,9 @@ make_config! {
         /// Duo Auth context cleanup schedule |> Cron schedule of the job that cleans expired Duo contexts from the database. Does nothing if Duo MFA is disabled or set to use the legacy iframe prompt.
         /// Defaults to once every minute. Set blank to disable this job.
         duo_context_purge_schedule:   String, false,  def,    "30 * * * * *".to_string();
+        /// Purge incomplete SSO nonce. |> Cron schedule of the job that cleans leftover nonce in db due to incomplete SSO login.
+        /// Defaults to daily. Set blank to disable this job.
+        purge_incomplete_sso_nonce: String, false,  def,   "0 20 0 * * *".to_string();
     },
 
     /// General settings
@@ -484,7 +513,8 @@ make_config! {
         disable_icon_download:  bool,   true,   def,    false;
         /// Allow new signups |> Controls whether new users can register. Users can be invited by the vaultwarden admin even if this is disabled
         signups_allowed:        bool,   true,   def,    true;
-        /// Require email verification on signups. This will prevent logins from succeeding until the address has been verified
+        /// Require email verification on signups. On new client versions, this will require verification at signup time. On older clients,
+        /// this will prevent logins from succeeding until the address has been verified
         signups_verify:         bool,   true,   def,    false;
         /// If signups require email verification, automatically re-send verification email if it hasn't been sent for a while (in seconds)
         signups_verify_resend_time: u64, true,  def,    3_600;
@@ -578,7 +608,7 @@ make_config! {
         authenticator_disable_time_drift: bool, true, def, false;
 
         /// Customize the enabled feature flags on the clients |> This is a comma separated list of feature flags to enable.
-        experimental_client_feature_flags: String, false, def, "fido2-vault-credentials".to_string();
+        experimental_client_feature_flags: String, false, def, String::new();
 
         /// Require new device emails |> When a user logs in an email is required to be sent.
         /// If sending the email fails the login attempt will fail.
@@ -609,8 +639,14 @@ make_config! {
         /// Timeout when acquiring database connection
         database_timeout:       u64,    false,  def,    30;
 
-        /// Database connection pool size
+        /// Timeout in seconds before idle connections to the database are closed
+        database_idle_timeout:  u64,    false, def,     600;
+
+        /// Database connection max pool size
         database_max_conns:     u32,    false,  def,    10;
+
+        /// Database connection min pool size
+        database_min_conns:     u32,    false,  def,    2;
 
         /// Database connection init |> SQL statements to run when creating a new database connection, mainly useful for connection-scoped pragmas. If empty, a database-specific default is used.
         database_conn_init:     String, false,  def,    String::new();
@@ -652,6 +688,42 @@ make_config! {
         enforce_single_org_with_reset_pw_policy: bool, false, def, false;
     },
 
+    /// OpenID Connect SSO settings
+    sso {
+        /// Enabled
+        sso_enabled:                    bool,   true,   def,    false;
+        /// Only SSO login |> Disable Email+Master Password login
+        sso_only:                       bool,   true,   def,    false;
+        /// Allow email association |> Associate existing non-SSO user based on email
+        sso_signups_match_email:        bool,   true,   def,    true;
+        /// Allow unknown email verification status |> Allowing this with `SSO_SIGNUPS_MATCH_EMAIL=true` open potential account takeover.
+        sso_allow_unknown_email_verification: bool, true, def, false;
+        /// Client ID
+        sso_client_id:                  String, true,   def,    String::new();
+        /// Client Key
+        sso_client_secret:              Pass,   true,   def,    String::new();
+        /// Authority Server |> Base url of the OIDC provider discovery endpoint (without `/.well-known/openid-configuration`)
+        sso_authority:                  String, true,   def,    String::new();
+        /// Authorization request scopes |> List the of the needed scope (`openid` is implicit)
+        sso_scopes:                     String, true,  def,   "email profile".to_string();
+        /// Authorization request extra parameters
+        sso_authorize_extra_params:     String, true,  def,    String::new();
+        /// Use PKCE during Authorization flow
+        sso_pkce:                       bool,   true,   def,    true;
+        /// Regex for additional trusted Id token audience |> By default only the client_id is trusted.
+        sso_audience_trusted:           String, true,  option;
+        /// CallBack Path |> Generated from Domain.
+        sso_callback_path:              String, true,  generated, |c| generate_sso_callback_path(&c.domain);
+        /// Optional SSO master password policy |> Ex format: '{"enforceOnLogin":false,"minComplexity":3,"minLength":12,"requireLower":false,"requireNumbers":false,"requireSpecial":false,"requireUpper":false}'
+        sso_master_password_policy:     String, true,  option;
+        /// Use SSO only for auth not the session lifecycle |> Use default Vaultwarden session lifecycle (Idle refresh token valid for 30days)
+        sso_auth_only_not_session:      bool,   true,   def,    false;
+        /// Client cache for discovery endpoint. |> Duration in seconds (0 or less to disable). More details: https://github.com/dani-garcia/vaultwarden/wiki/Enabling-SSO-support-using-OpenId-Connect#client-cache
+        sso_client_cache_expiration:    u64,    true,   def,    0;
+        /// Log all tokens |> `LOG_LEVEL=debug` or `LOG_LEVEL=info,vaultwarden::sso=debug` is required
+        sso_debug_tokens:               bool,   true,   def,    false;
+    },
+
     /// Yubikey settings
     yubico: _enable_yubico {
         /// Enabled
@@ -670,9 +742,9 @@ make_config! {
         _enable_duo:            bool,   true,   def,     true;
         /// Attempt to use deprecated iframe-based Traditional Prompt (Duo WebSDK 2)
         duo_use_iframe:         bool,   false,  def,     false;
-        /// Integration Key
+        /// Client Id
         duo_ikey:               String, true,   option;
-        /// Secret Key
+        /// Client Secret
         duo_skey:               Pass,   true,   option;
         /// Host
         duo_host:               String, true,   option;
@@ -710,7 +782,7 @@ make_config! {
         smtp_auth_mechanism:           String, true,   option;
         /// SMTP connection timeout |> Number of seconds when to stop trying to connect to the SMTP server
         smtp_timeout:                  u64,    true,   def,     15;
-        /// Server name sent during HELO |> By default this value should be is on the machine's hostname, but might need to be changed in case it trips some anti-spam filters
+        /// Server name sent during HELO |> By default this value should be the machine's hostname, but might need to be changed in case it trips some anti-spam filters
         helo_name:                     String, true,   option;
         /// Embed images as email attachments.
         smtp_embed_images:             bool, true, def, true;
@@ -734,7 +806,7 @@ make_config! {
         email_expiration_time:  u64,    true,   def,      600;
         /// Maximum attempts |> Maximum attempts before an email token is reset and a new email will need to be sent
         email_attempts_limit:   u64,    true,   def,      3;
-        /// Automatically enforce at login |> Setup email 2FA provider regardless of any organization policy
+        /// Setup email 2FA at signup |> Setup email 2FA provider on registration regardless of any organization policy
         email_2fa_enforce_on_verified_invite: bool,   true,   def,      false;
         /// Auto-enable 2FA (Know the risks!) |> Automatically setup email 2FA as fallback provider when needed
         email_2fa_auto_fallback: bool,  true,   def,      false;
@@ -760,6 +832,14 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
     let limit = 256;
     if cfg.database_max_conns < 1 || cfg.database_max_conns > limit {
         err!(format!("`DATABASE_MAX_CONNS` contains an invalid value. Ensure it is between 1 and {limit}.",));
+    }
+
+    if cfg.database_min_conns < 1 || cfg.database_min_conns > limit {
+        err!(format!("`DATABASE_MIN_CONNS` contains an invalid value. Ensure it is between 1 and {limit}.",));
+    }
+
+    if cfg.database_min_conns > cfg.database_max_conns {
+        err!(format!("`DATABASE_MIN_CONNS` must be smaller than or equal to `DATABASE_MAX_CONNS`.",));
     }
 
     if let Some(log_file) = &cfg.log_file {
@@ -832,16 +912,25 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         }
     }
 
-    // TODO: deal with deprecated flags so they can be removed from this list, cf. #4263
+    // Server (v2025.6.2): https://github.com/bitwarden/server/blob/d094be3267f2030bd0dc62106bc6871cf82682f5/src/Core/Constants.cs#L103
+    // Client (web-v2025.6.1): https://github.com/bitwarden/clients/blob/747c2fd6a1c348a57a76e4a7de8128466ffd3c01/libs/common/src/enums/feature-flag.enum.ts#L12
+    // Android (v2025.6.0): https://github.com/bitwarden/android/blob/b5b022caaad33390c31b3021b2c1205925b0e1a2/app/src/main/kotlin/com/x8bit/bitwarden/data/platform/manager/model/FlagKey.kt#L22
+    // iOS (v2025.6.0): https://github.com/bitwarden/ios/blob/ff06d9c6cc8da89f78f37f376495800201d7261a/BitwardenShared/Core/Platform/Models/Enum/FeatureFlag.swift#L7
+    //
+    // NOTE: Move deprecated flags to the utils::parse_experimental_client_feature_flags() DEPRECATED_FLAGS const!
     const KNOWN_FLAGS: &[&str] = &[
-        "autofill-overlay",
-        "autofill-v2",
-        "browser-fileless-import",
-        "extension-refresh",
-        "fido2-vault-credentials",
+        // Autofill Team
         "inline-menu-positioning-improvements",
-        "ssh-key-vault-item",
+        "inline-menu-totp",
         "ssh-agent",
+        // Key Management Team
+        "ssh-key-vault-item",
+        // Tools
+        "export-attachments",
+        // Mobile Team
+        "anon-addy-self-host-alias",
+        "simple-login-self-host-alias",
+        "mutual-tls",
     ];
     let configured_flags = parse_experimental_client_feature_flags(&cfg.experimental_client_feature_flags);
     let invalid_flags: Vec<_> = configured_flags.keys().filter(|flag| !KNOWN_FLAGS.contains(&flag.as_str())).collect();
@@ -876,6 +965,16 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         && !(cfg.duo_host.is_some() && cfg.duo_ikey.is_some() && cfg.duo_skey.is_some())
     {
         err!("All Duo options need to be set for global Duo support")
+    }
+
+    if cfg.sso_enabled {
+        if cfg.sso_client_id.is_empty() || cfg.sso_client_secret.is_empty() || cfg.sso_authority.is_empty() {
+            err!("`SSO_CLIENT_ID`, `SSO_CLIENT_SECRET` and `SSO_AUTHORITY` must be set for SSO support")
+        }
+
+        validate_internal_sso_issuer_url(&cfg.sso_authority)?;
+        validate_internal_sso_redirect_url(&cfg.sso_callback_path)?;
+        validate_sso_master_password_policy(&cfg.sso_master_password_policy)?;
     }
 
     if cfg._enable_yubico {
@@ -1055,6 +1154,35 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_internal_sso_issuer_url(sso_authority: &String) -> Result<openidconnect::IssuerUrl, Error> {
+    match openidconnect::IssuerUrl::new(sso_authority.clone()) {
+        Err(err) => err!(format!("Invalid sso_authority URL ({sso_authority}): {err}")),
+        Ok(issuer_url) => Ok(issuer_url),
+    }
+}
+
+fn validate_internal_sso_redirect_url(sso_callback_path: &String) -> Result<openidconnect::RedirectUrl, Error> {
+    match openidconnect::RedirectUrl::new(sso_callback_path.clone()) {
+        Err(err) => err!(format!("Invalid sso_callback_path ({sso_callback_path} built using `domain`) URL: {err}")),
+        Ok(redirect_url) => Ok(redirect_url),
+    }
+}
+
+fn validate_sso_master_password_policy(
+    sso_master_password_policy: &Option<String>,
+) -> Result<Option<serde_json::Value>, Error> {
+    let policy = sso_master_password_policy.as_ref().map(|mpp| serde_json::from_str::<serde_json::Value>(mpp));
+
+    match policy {
+        None => Ok(None),
+        Some(Ok(jsobject @ serde_json::Value::Object(_))) => Ok(Some(jsobject)),
+        Some(Ok(_)) => err!("Invalid sso_master_password_policy: parsed value is not a JSON object"),
+        Some(Err(error)) => {
+            err!(format!("Invalid sso_master_password_policy ({error}), Ensure that it's correctly escaped with ''"))
+        }
+    }
+}
+
 /// Extracts an RFC 6454 web origin from a URL.
 fn extract_url_origin(url: &str) -> String {
     match Url::parse(url) {
@@ -1084,6 +1212,10 @@ fn generate_smtp_img_src(embed_images: bool, domain: &str) -> String {
     } else {
         format!("{domain}/vw_static/")
     }
+}
+
+fn generate_sso_callback_path(domain: &str) -> String {
+    format!("{domain}/identity/connect/oidc-signin")
 }
 
 /// Generate the correct URL for the icon service.
@@ -1128,11 +1260,103 @@ fn smtp_convert_deprecated_ssl_options(smtp_ssl: Option<bool>, smtp_explicit_tls
     "starttls".to_string()
 }
 
+fn opendal_operator_for_path(path: &str) -> Result<opendal::Operator, Error> {
+    // Cache of previously built operators by path
+    static OPERATORS_BY_PATH: LazyLock<dashmap::DashMap<String, opendal::Operator>> =
+        LazyLock::new(dashmap::DashMap::new);
+
+    if let Some(operator) = OPERATORS_BY_PATH.get(path) {
+        return Ok(operator.clone());
+    }
+
+    let operator = if path.starts_with("s3://") {
+        #[cfg(not(s3))]
+        return Err(opendal::Error::new(opendal::ErrorKind::ConfigInvalid, "S3 support is not enabled").into());
+
+        #[cfg(s3)]
+        opendal_s3_operator_for_path(path)?
+    } else {
+        let builder = opendal::services::Fs::default().root(path);
+        opendal::Operator::new(builder)?.finish()
+    };
+
+    OPERATORS_BY_PATH.insert(path.to_string(), operator.clone());
+
+    Ok(operator)
+}
+
+#[cfg(s3)]
+fn opendal_s3_operator_for_path(path: &str) -> Result<opendal::Operator, Error> {
+    use crate::http_client::aws::AwsReqwestConnector;
+    use aws_config::{default_provider::credentials::DefaultCredentialsChain, provider_config::ProviderConfig};
+
+    // This is a custom AWS credential loader that uses the official AWS Rust
+    // SDK config crate to load credentials. This ensures maximum compatibility
+    // with AWS credential configurations. For example, OpenDAL doesn't support
+    // AWS SSO temporary credentials yet.
+    struct OpenDALS3CredentialLoader {}
+
+    #[async_trait]
+    impl reqsign::AwsCredentialLoad for OpenDALS3CredentialLoader {
+        async fn load_credential(&self, _client: reqwest::Client) -> anyhow::Result<Option<reqsign::AwsCredential>> {
+            use aws_credential_types::provider::ProvideCredentials as _;
+            use tokio::sync::OnceCell;
+
+            static DEFAULT_CREDENTIAL_CHAIN: OnceCell<DefaultCredentialsChain> = OnceCell::const_new();
+
+            let chain = DEFAULT_CREDENTIAL_CHAIN
+                .get_or_init(|| {
+                    let reqwest_client = reqwest::Client::builder().build().unwrap();
+                    let connector = AwsReqwestConnector {
+                        client: reqwest_client,
+                    };
+
+                    let conf = ProviderConfig::default().with_http_client(connector);
+
+                    DefaultCredentialsChain::builder().configure(conf).build()
+                })
+                .await;
+
+            let creds = chain.provide_credentials().await?;
+
+            Ok(Some(reqsign::AwsCredential {
+                access_key_id: creds.access_key_id().to_string(),
+                secret_access_key: creds.secret_access_key().to_string(),
+                session_token: creds.session_token().map(|s| s.to_string()),
+                expires_in: creds.expiry().map(|expiration| expiration.into()),
+            }))
+        }
+    }
+
+    const OPEN_DAL_S3_CREDENTIAL_LOADER: OpenDALS3CredentialLoader = OpenDALS3CredentialLoader {};
+
+    let url = Url::parse(path).map_err(|e| format!("Invalid path S3 URL path {path:?}: {e}"))?;
+
+    let bucket = url.host_str().ok_or_else(|| format!("Missing Bucket name in data folder S3 URL {path:?}"))?;
+
+    let builder = opendal::services::S3::default()
+        .customized_credential_load(Box::new(OPEN_DAL_S3_CREDENTIAL_LOADER))
+        .enable_virtual_host_style()
+        .bucket(bucket)
+        .root(url.path())
+        .default_storage_class("INTELLIGENT_TIERING");
+
+    Ok(opendal::Operator::new(builder)?.finish())
+}
+
+pub enum PathType {
+    Data,
+    IconCache,
+    Attachments,
+    Sends,
+    RsaKey,
+}
+
 impl Config {
-    pub fn load() -> Result<Self, Error> {
+    pub async fn load() -> Result<Self, Error> {
         // Loading from env and file
         let _env = ConfigBuilder::from_env();
-        let _usr = ConfigBuilder::from_file(&CONFIG_FILE).unwrap_or_default();
+        let _usr = ConfigBuilder::from_file().await.unwrap_or_default();
 
         // Create merged config, config file overwrites env
         let mut _overrides = Vec::new();
@@ -1156,7 +1380,7 @@ impl Config {
         })
     }
 
-    pub fn update_config(&self, other: ConfigBuilder, ignore_non_editable: bool) -> Result<(), Error> {
+    pub async fn update_config(&self, other: ConfigBuilder, ignore_non_editable: bool) -> Result<(), Error> {
         // Remove default values
         //let builder = other.remove(&self.inner.read().unwrap()._env);
 
@@ -1188,20 +1412,19 @@ impl Config {
         }
 
         //Save to file
-        use std::{fs::File, io::Write};
-        let mut file = File::create(&*CONFIG_FILE)?;
-        file.write_all(config_str.as_bytes())?;
+        let operator = opendal_operator_for_path(&CONFIG_FILE_PARENT_DIR)?;
+        operator.write(&CONFIG_FILENAME, config_str).await?;
 
         Ok(())
     }
 
-    fn update_config_partial(&self, other: ConfigBuilder) -> Result<(), Error> {
+    async fn update_config_partial(&self, other: ConfigBuilder) -> Result<(), Error> {
         let builder = {
             let usr = &self.inner.read().unwrap()._usr;
             let mut _overrides = Vec::new();
             usr.merge(&other, false, &mut _overrides)
         };
-        self.update_config(builder, false)
+        self.update_config(builder, false).await
     }
 
     /// Tests whether an email's domain is allowed. A domain is allowed if it
@@ -1210,7 +1433,7 @@ impl Config {
     pub fn is_email_domain_allowed(&self, email: &str) -> bool {
         let e: Vec<&str> = email.rsplitn(2, '@').collect();
         if e.len() != 2 || e[0].is_empty() || e[1].is_empty() {
-            warn!("Failed to parse email address '{}'", email);
+            warn!("Failed to parse email address '{email}'");
             return false;
         }
         let email_domain = e[0].to_lowercase();
@@ -1230,6 +1453,16 @@ impl Config {
         }
     }
 
+    // The registration link should be hidden if
+    //  - Signup is not allowed and email whitelist is empty unless mail is disabled and invitations are allowed
+    //  - The SSO is activated and password login is disabled.
+    pub fn is_signup_disabled(&self) -> bool {
+        (!self.signups_allowed()
+            && self.signups_domains_whitelist().is_empty()
+            && (self.mail_enabled() || !self.invitations_allowed()))
+            || (self.sso_enabled() && self.sso_only())
+    }
+
     /// Tests whether the specified user is allowed to create an organization.
     pub fn is_org_creation_allowed(&self, email: &str) -> bool {
         let users = self.org_creation_users();
@@ -1243,8 +1476,9 @@ impl Config {
         }
     }
 
-    pub fn delete_user_config(&self) -> Result<(), Error> {
-        std::fs::remove_file(&*CONFIG_FILE)?;
+    pub async fn delete_user_config(&self) -> Result<(), Error> {
+        let operator = opendal_operator_for_path(&CONFIG_FILE_PARENT_DIR)?;
+        operator.delete(&CONFIG_FILENAME).await?;
 
         // Empty user config
         let usr = ConfigBuilder::default();
@@ -1274,7 +1508,7 @@ impl Config {
         inner._enable_smtp && (inner.smtp_host.is_some() || inner.use_sendmail)
     }
 
-    pub fn get_duo_akey(&self) -> String {
+    pub async fn get_duo_akey(&self) -> String {
         if let Some(akey) = self._duo_akey() {
             akey
         } else {
@@ -1285,10 +1519,14 @@ impl Config {
                 _duo_akey: Some(akey_s.clone()),
                 ..Default::default()
             };
-            self.update_config_partial(builder).ok();
+            self.update_config_partial(builder).await.ok();
 
             akey_s
         }
+    }
+
+    pub fn is_webauthn_2fa_supported(&self) -> bool {
+        Url::parse(&self.domain()).expect("DOMAIN not a valid URL").domain().is_some()
     }
 
     /// Tests whether the admin token is set to a non-empty value.
@@ -1296,6 +1534,23 @@ impl Config {
         let token = self.admin_token();
 
         token.is_some() && !token.unwrap().trim().is_empty()
+    }
+
+    pub fn opendal_operator_for_path_type(&self, path_type: PathType) -> Result<opendal::Operator, Error> {
+        let path = match path_type {
+            PathType::Data => self.data_folder(),
+            PathType::IconCache => self.icon_cache_folder(),
+            PathType::Attachments => self.attachments_folder(),
+            PathType::Sends => self.sends_folder(),
+            PathType::RsaKey => std::path::Path::new(&self.rsa_key_filename())
+                .parent()
+                .ok_or_else(|| std::io::Error::other("Failed to get directory of RSA key file"))?
+                .to_str()
+                .ok_or_else(|| std::io::Error::other("Failed to convert RSA key file directory to UTF-8 string"))?
+                .to_string(),
+        };
+
+        opendal_operator_for_path(&path)
     }
 
     pub fn render_template<T: serde::ser::Serialize>(&self, name: &str, data: &T) -> Result<String, Error> {
@@ -1324,6 +1579,26 @@ impl Config {
                 handle.notify();
             }
         }
+    }
+
+    pub fn sso_issuer_url(&self) -> Result<openidconnect::IssuerUrl, Error> {
+        validate_internal_sso_issuer_url(&self.sso_authority())
+    }
+
+    pub fn sso_redirect_url(&self) -> Result<openidconnect::RedirectUrl, Error> {
+        validate_internal_sso_redirect_url(&self.sso_callback_path())
+    }
+
+    pub fn sso_master_password_policy_value(&self) -> Option<serde_json::Value> {
+        validate_sso_master_password_policy(&self.sso_master_password_policy()).ok().flatten()
+    }
+
+    pub fn sso_scopes_vec(&self) -> Vec<String> {
+        self.sso_scopes().split_whitespace().map(str::to_string).collect()
+    }
+
+    pub fn sso_authorize_extra_params_vec(&self) -> Vec<(String, String)> {
+        url::form_urlencoded::parse(self.sso_authorize_extra_params().as_bytes()).into_owned().collect()
     }
 }
 
@@ -1367,6 +1642,7 @@ where
     reg!("email/email_footer_text");
 
     reg!("email/admin_reset_password", ".html");
+    reg!("email/change_email_existing", ".html");
     reg!("email/change_email", ".html");
     reg!("email/delete_account", ".html");
     reg!("email/emergency_access_invite_accepted", ".html");
@@ -1383,11 +1659,13 @@ where
     reg!("email/protected_action", ".html");
     reg!("email/pw_hint_none", ".html");
     reg!("email/pw_hint_some", ".html");
+    reg!("email/register_verify_email", ".html");
     reg!("email/send_2fa_removed_from_org", ".html");
     reg!("email/send_emergency_access_invite", ".html");
     reg!("email/send_org_invite", ".html");
     reg!("email/send_single_org_removed_from_org", ".html");
     reg!("email/smtp_test", ".html");
+    reg!("email/sso_change_email", ".html");
     reg!("email/twofactor_email", ".html");
     reg!("email/verify_email", ".html");
     reg!("email/welcome_must_verify", ".html");

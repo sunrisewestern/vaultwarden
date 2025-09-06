@@ -10,7 +10,7 @@ use crate::{
     auth::Headers,
     crypto,
     db::{
-        models::{EventType, TwoFactor, TwoFactorType, User, UserId},
+        models::{DeviceId, EventType, TwoFactor, TwoFactorType, User, UserId},
         DbConn,
     },
     error::{Error, MapResult},
@@ -24,11 +24,16 @@ pub fn routes() -> Vec<Route> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SendEmailLoginData {
-    // DeviceIdentifier: String, // Currently not used
+    #[serde(alias = "DeviceIdentifier")]
+    device_identifier: DeviceId,
+
+    #[allow(unused)]
     #[serde(alias = "Email")]
-    email: String,
+    email: Option<String>,
+
+    #[allow(unused)]
     #[serde(alias = "MasterPasswordHash")]
-    master_password_hash: String,
+    master_password_hash: Option<String>,
 }
 
 /// User is trying to login and wants to use email 2FA.
@@ -40,14 +45,9 @@ async fn send_email_login(data: Json<SendEmailLoginData>, mut conn: DbConn) -> E
     use crate::db::models::User;
 
     // Get the user
-    let Some(user) = User::find_by_mail(&data.email, &mut conn).await else {
-        err!("Username or password is incorrect. Try again.")
+    let Some(user) = User::find_by_device_id(&data.device_identifier, &mut conn).await else {
+        err!("Cannot find user. Try again.")
     };
-
-    // Check password
-    if !user.check_valid_password(&data.master_password_hash) {
-        err!("Username or password is incorrect. Try again.")
-    }
 
     if !CONFIG._enable_email_2fa() {
         err!("Email 2FA is disabled")
@@ -197,14 +197,20 @@ async fn email(data: Json<EmailData>, headers: Headers, mut conn: DbConn) -> Jso
 }
 
 /// Validate the email code when used as TwoFactor token mechanism
-pub async fn validate_email_code_str(user_id: &UserId, token: &str, data: &str, conn: &mut DbConn) -> EmptyResult {
+pub async fn validate_email_code_str(
+    user_id: &UserId,
+    token: &str,
+    data: &str,
+    ip: &std::net::IpAddr,
+    conn: &mut DbConn,
+) -> EmptyResult {
     let mut email_data = EmailTokenData::from_json(data)?;
     let mut twofactor = TwoFactor::find_by_user_and_type(user_id, TwoFactorType::Email as i32, conn)
         .await
         .map_res("Two factor not found")?;
     let Some(issued_token) = &email_data.last_token else {
         err!(
-            "No token available",
+            format!("No token available! IP: {ip}"),
             ErrorEvent {
                 event: EventType::UserFailedLogIn2fa
             }
@@ -220,7 +226,7 @@ pub async fn validate_email_code_str(user_id: &UserId, token: &str, data: &str, 
         twofactor.save(conn).await?;
 
         err!(
-            "Token is invalid",
+            format!("Token is invalid! IP: {ip}"),
             ErrorEvent {
                 event: EventType::UserFailedLogIn2fa
             }
@@ -323,7 +329,7 @@ pub fn obscure_email(email: &str) -> String {
         }
     };
 
-    format!("{}@{}", new_name, &domain)
+    format!("{new_name}@{domain}")
 }
 
 pub async fn find_and_activate_email_2fa(user_id: &UserId, conn: &mut DbConn) -> EmptyResult {

@@ -26,8 +26,8 @@ pub fn routes() -> Vec<Route> {
 #[derive(Serialize, Deserialize)]
 struct DuoData {
     host: String, // Duo API hostname
-    ik: String,   // integration key
-    sk: String,   // secret key
+    ik: String,   // client id
+    sk: String,   // client secret
 }
 
 impl DuoData {
@@ -111,13 +111,16 @@ async fn get_duo(data: Json<PasswordOrOtpData>, headers: Headers, mut conn: DbCo
         json!({
             "enabled": enabled,
             "host": data.host,
-            "secretKey": data.sk,
-            "integrationKey": data.ik,
+            "clientSecret": data.sk,
+            "clientId": data.ik,
             "object": "twoFactorDuo"
         })
     } else {
         json!({
             "enabled": enabled,
+            "host": null,
+            "clientSecret": null,
+            "clientId": null,
             "object": "twoFactorDuo"
         })
     };
@@ -129,8 +132,8 @@ async fn get_duo(data: Json<PasswordOrOtpData>, headers: Headers, mut conn: DbCo
 #[serde(rename_all = "camelCase")]
 struct EnableDuoData {
     host: String,
-    secret_key: String,
-    integration_key: String,
+    client_secret: String,
+    client_id: String,
     master_password_hash: Option<String>,
     otp: Option<String>,
 }
@@ -139,8 +142,8 @@ impl From<EnableDuoData> for DuoData {
     fn from(d: EnableDuoData) -> Self {
         Self {
             host: d.host,
-            ik: d.integration_key,
-            sk: d.secret_key,
+            ik: d.client_id,
+            sk: d.client_secret,
         }
     }
 }
@@ -151,7 +154,7 @@ fn check_duo_fields_custom(data: &EnableDuoData) -> bool {
         st.is_empty() || s == DISABLED_MESSAGE_DEFAULT
     }
 
-    !empty_or_default(&data.host) && !empty_or_default(&data.secret_key) && !empty_or_default(&data.integration_key)
+    !empty_or_default(&data.host) && !empty_or_default(&data.client_secret) && !empty_or_default(&data.client_id)
 }
 
 #[post("/two-factor/duo", data = "<data>")]
@@ -186,8 +189,8 @@ async fn activate_duo(data: Json<EnableDuoData>, headers: Headers, mut conn: DbC
     Ok(Json(json!({
         "enabled": true,
         "host": data.host,
-        "secretKey": data.sk,
-        "integrationKey": data.ik,
+        "clientSecret": data.sk,
+        "clientId": data.ik,
         "object": "twoFactorDuo"
     })))
 }
@@ -202,7 +205,7 @@ async fn duo_api_request(method: &str, path: &str, params: &str, data: &DuoData)
     use std::str::FromStr;
 
     // https://duo.com/docs/authapi#api-details
-    let url = format!("https://{}{}", &data.host, path);
+    let url = format!("https://{}{path}", &data.host);
     let date = Utc::now().to_rfc2822();
     let username = &data.ik;
     let fields = [&date, method, &data.host, path, params];
@@ -258,7 +261,7 @@ pub(crate) async fn get_duo_keys_email(email: &str, conn: &mut DbConn) -> ApiRes
     }
     .map_res("Can't fetch Duo Keys")?;
 
-    Ok((data.ik, data.sk, CONFIG.get_duo_akey(), data.host))
+    Ok((data.ik, data.sk, CONFIG.get_duo_akey().await, data.host))
 }
 
 pub async fn generate_duo_signature(email: &str, conn: &mut DbConn) -> ApiResult<(String, String)> {
@@ -274,9 +277,9 @@ pub async fn generate_duo_signature(email: &str, conn: &mut DbConn) -> ApiResult
 
 fn sign_duo_values(key: &str, email: &str, ikey: &str, prefix: &str, expire: i64) -> String {
     let val = format!("{email}|{ikey}|{expire}");
-    let cookie = format!("{}|{}", prefix, BASE64.encode(val.as_bytes()));
+    let cookie = format!("{prefix}|{}", BASE64.encode(val.as_bytes()));
 
-    format!("{}|{}", cookie, crypto::hmac_sign(key, &cookie))
+    format!("{cookie}|{}", crypto::hmac_sign(key, &cookie))
 }
 
 pub async fn validate_duo_login(email: &str, response: &str, conn: &mut DbConn) -> EmptyResult {

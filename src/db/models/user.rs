@@ -8,15 +8,17 @@ use super::{
 use crate::{
     api::EmptyResult,
     crypto,
+    db::models::DeviceId,
     db::DbConn,
     error::MapResult,
+    sso::OIDCIdentifier,
     util::{format_date, get_uuid, retry},
     CONFIG,
 };
 use macros::UuidFromParam;
 
 db_object! {
-    #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
+    #[derive(Identifiable, Queryable, Insertable, AsChangeset, Selectable)]
     #[diesel(table_name = users)]
     #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid))]
@@ -71,6 +73,14 @@ db_object! {
     pub struct Invitation {
         pub email: String,
     }
+
+    #[derive(Identifiable, Queryable, Insertable, Selectable)]
+    #[diesel(table_name = sso_users)]
+    #[diesel(primary_key(user_uuid))]
+    pub struct SsoUser {
+        pub user_uuid: UserId,
+        pub identifier: OIDCIdentifier,
+    }
 }
 
 pub enum UserKdfType {
@@ -96,7 +106,7 @@ impl User {
     pub const CLIENT_KDF_TYPE_DEFAULT: i32 = UserKdfType::Pbkdf2 as i32;
     pub const CLIENT_KDF_ITER_DEFAULT: i32 = 600_000;
 
-    pub fn new(email: String) -> Self {
+    pub fn new(email: String, name: Option<String>) -> Self {
         let now = Utc::now().naive_utc();
         let email = email.to_lowercase();
 
@@ -108,7 +118,7 @@ impl User {
             verified_at: None,
             last_verifying_at: None,
             login_verify_count: 0,
-            name: email.clone(),
+            name: name.unwrap_or(email.clone()),
             email,
             akey: String::new(),
             email_new: None,
@@ -173,8 +183,8 @@ impl User {
     /// * `password` - A str which contains a hashed version of the users master password.
     /// * `new_key` - A String  which contains the new aKey value of the users master password.
     /// * `allow_next_route` - A Option<Vec<String>> with the function names of the next allowed (rocket) routes.
-    ///                       These routes are able to use the previous stamp id for the next 2 minutes.
-    ///                       After these 2 minutes this stamp will expire.
+    ///   These routes are able to use the previous stamp id for the next 2 minutes.
+    ///   After these 2 minutes this stamp will expire.
     ///
     pub fn set_password(
         &mut self,
@@ -206,8 +216,8 @@ impl User {
     ///
     /// # Arguments
     /// * `route_exception` - A Vec<String> with the function names of the next allowed (rocket) routes.
-    ///                       These routes are able to use the previous stamp id for the next 2 minutes.
-    ///                       After these 2 minutes this stamp will expire.
+    ///   These routes are able to use the previous stamp id for the next 2 minutes.
+    ///   After these 2 minutes this stamp will expire.
     ///
     pub fn set_stamp_exception(&mut self, route_exception: Vec<String>) {
         let stamp_exception = UserStampException {
@@ -249,7 +259,6 @@ impl User {
             "emailVerified": !CONFIG.mail_enabled() || self.verified_at.is_some(),
             "premium": true,
             "premiumFromOrganization": false,
-            "masterPasswordHint": self.password_hint,
             "culture": "en-US",
             "twoFactorEnabled": twofactor_enabled,
             "key": self.akey,
@@ -334,7 +343,7 @@ impl User {
 
     pub async fn update_uuid_revision(uuid: &UserId, conn: &mut DbConn) {
         if let Err(e) = Self::_update_revision(uuid, &Utc::now().naive_utc(), conn).await {
-            warn!("Failed to update revision for {}: {:#?}", uuid, e);
+            warn!("Failed to update revision for {uuid}: {e:#?}");
         }
     }
 
@@ -385,9 +394,28 @@ impl User {
         }}
     }
 
-    pub async fn get_all(conn: &mut DbConn) -> Vec<Self> {
+    pub async fn find_by_device_id(device_uuid: &DeviceId, conn: &mut DbConn) -> Option<Self> {
+        db_run! { conn: {
+            users::table
+                .inner_join(devices::table.on(devices::user_uuid.eq(users::uuid)))
+                .filter(devices::uuid.eq(device_uuid))
+                .select(users::all_columns)
+                .first::<UserDb>(conn)
+                .ok()
+                .from_db()
+        }}
+    }
+
+    pub async fn get_all(conn: &mut DbConn) -> Vec<(User, Option<SsoUser>)> {
         db_run! {conn: {
-            users::table.load::<UserDb>(conn).expect("Error loading users").from_db()
+            users::table
+                .left_join(sso_users::table)
+                .select(<(UserDb, Option<SsoUserDb>)>::as_select())
+                .load(conn)
+                .expect("Error loading groups for user")
+                .into_iter()
+                .map(|(user, sso_user)| { (user.from_db(), sso_user.from_db()) })
+                .collect()
         }}
     }
 
@@ -478,3 +506,57 @@ impl Invitation {
 #[deref(forward)]
 #[from(forward)]
 pub struct UserId(String);
+
+impl SsoUser {
+    pub async fn save(&self, conn: &mut DbConn) -> EmptyResult {
+        db_run! { conn:
+            sqlite, mysql {
+                diesel::replace_into(sso_users::table)
+                    .values(SsoUserDb::to_db(self))
+                    .execute(conn)
+                    .map_res("Error saving SSO user")
+            }
+            postgresql {
+                let value = SsoUserDb::to_db(self);
+                diesel::insert_into(sso_users::table)
+                    .values(&value)
+                    .execute(conn)
+                    .map_res("Error saving SSO user")
+            }
+        }
+    }
+
+    pub async fn find_by_identifier(identifier: &str, conn: &DbConn) -> Option<(User, SsoUser)> {
+        db_run! {conn: {
+            users::table
+                .inner_join(sso_users::table)
+                .select(<(UserDb, SsoUserDb)>::as_select())
+                .filter(sso_users::identifier.eq(identifier))
+                .first::<(UserDb, SsoUserDb)>(conn)
+                .ok()
+                .map(|(user, sso_user)| { (user.from_db(), sso_user.from_db()) })
+        }}
+    }
+
+    pub async fn find_by_mail(mail: &str, conn: &DbConn) -> Option<(User, Option<SsoUser>)> {
+        let lower_mail = mail.to_lowercase();
+
+        db_run! {conn: {
+            users::table
+                .left_join(sso_users::table)
+                .select(<(UserDb, Option<SsoUserDb>)>::as_select())
+                .filter(users::email.eq(lower_mail))
+                .first::<(UserDb, Option<SsoUserDb>)>(conn)
+                .ok()
+                .map(|(user, sso_user)| { (user.from_db(), sso_user.from_db()) })
+        }}
+    }
+
+    pub async fn delete(user_uuid: &UserId, conn: &mut DbConn) -> EmptyResult {
+        db_run! {conn: {
+            diesel::delete(sso_users::table.filter(sso_users::user_uuid.eq(user_uuid)))
+                .execute(conn)
+                .map_res("Error deleting sso user")
+        }}
+    }
+}

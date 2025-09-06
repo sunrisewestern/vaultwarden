@@ -17,6 +17,7 @@ use macros::UuidFromParam;
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
     #[diesel(table_name = organizations)]
+    #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid))]
     pub struct Organization {
         pub uuid: OrganizationId,
@@ -28,11 +29,14 @@ db_object! {
 
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
     #[diesel(table_name = users_organizations)]
+    #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid))]
     pub struct Membership {
         pub uuid: MembershipId,
         pub user_uuid: UserId,
         pub org_uuid: OrganizationId,
+
+        pub invited_by_email: Option<String>,
 
         pub access_all: bool,
         pub akey: String,
@@ -54,12 +58,26 @@ db_object! {
     }
 }
 
-// https://github.com/bitwarden/server/blob/b86a04cef9f1e1b82cf18e49fc94e017c641130c/src/Core/Enums/OrganizationUserStatusType.cs
+// https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Core/AdminConsole/Enums/OrganizationUserStatusType.cs
+#[derive(PartialEq)]
 pub enum MembershipStatus {
     Revoked = -1,
     Invited = 0,
     Accepted = 1,
     Confirmed = 2,
+}
+
+impl MembershipStatus {
+    pub fn from_i32(status: i32) -> Option<Self> {
+        match status {
+            0 => Some(Self::Invited),
+            1 => Some(Self::Accepted),
+            2 => Some(Self::Confirmed),
+            // NOTE: we don't care about revoked members where this is used
+            // if this ever changes also adapt the OrgHeaders check.
+            _ => None,
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, num_derive::FromPrimitive)]
@@ -161,7 +179,7 @@ impl Organization {
             public_key,
         }
     }
-    // https://github.com/bitwarden/server/blob/13d1e74d6960cf0d042620b72d85bf583a4236f7/src/Api/Models/Response/Organizations/OrganizationResponseModel.cs
+    // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Models/Response/Organizations/OrganizationResponseModel.cs
     pub fn to_json(&self) -> Value {
         json!({
             "id": self.uuid,
@@ -187,7 +205,6 @@ impl Organization {
             "useResetPassword": CONFIG.mail_enabled(),
             "allowAdminAccessToAllCollectionItems": true,
             "limitCollectionCreation": true,
-            "limitCollectionCreationDeletion": true,
             "limitCollectionDeletion": true,
 
             "businessName": self.name,
@@ -220,12 +237,13 @@ impl Organization {
 const ACTIVATE_REVOKE_DIFF: i32 = 128;
 
 impl Membership {
-    pub fn new(user_uuid: UserId, org_uuid: OrganizationId) -> Self {
+    pub fn new(user_uuid: UserId, org_uuid: OrganizationId, invited_by_email: Option<String>) -> Self {
         Self {
             uuid: MembershipId(crate::util::get_uuid()),
 
             user_uuid,
             org_uuid,
+            invited_by_email,
 
             access_all: false,
             akey: String::new(),
@@ -374,9 +392,51 @@ impl Organization {
         }}
     }
 
+    pub async fn find_by_name(name: &str, conn: &mut DbConn) -> Option<Self> {
+        db_run! { conn: {
+            organizations::table
+                .filter(organizations::name.eq(name))
+                .first::<OrganizationDb>(conn)
+                .ok().from_db()
+        }}
+    }
+
     pub async fn get_all(conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             organizations::table.load::<OrganizationDb>(conn).expect("Error loading organizations").from_db()
+        }}
+    }
+
+    pub async fn find_main_org_user_email(user_email: &str, conn: &mut DbConn) -> Option<Organization> {
+        let lower_mail = user_email.to_lowercase();
+
+        db_run! { conn: {
+            organizations::table
+                .inner_join(users_organizations::table.on(users_organizations::org_uuid.eq(organizations::uuid)))
+                .inner_join(users::table.on(users::uuid.eq(users_organizations::user_uuid)))
+                .filter(users::email.eq(lower_mail))
+                .filter(users_organizations::status.ne(MembershipStatus::Revoked as i32))
+                .order(users_organizations::atype.asc())
+                .select(organizations::all_columns)
+                .first::<OrganizationDb>(conn)
+                .ok().from_db()
+        }}
+    }
+
+    pub async fn find_org_user_email(user_email: &str, conn: &mut DbConn) -> Vec<Organization> {
+        let lower_mail = user_email.to_lowercase();
+
+        db_run! { conn: {
+            organizations::table
+                .inner_join(users_organizations::table.on(users_organizations::org_uuid.eq(organizations::uuid)))
+                .inner_join(users::table.on(users::uuid.eq(users_organizations::user_uuid)))
+                .filter(users::email.eq(lower_mail))
+                .filter(users_organizations::status.ne(MembershipStatus::Revoked as i32))
+                .order(users_organizations::atype.asc())
+                .select(organizations::all_columns)
+                .load::<OrganizationDb>(conn)
+                .expect("Error loading user orgs")
+                .from_db()
         }}
     }
 }
@@ -408,7 +468,7 @@ impl Membership {
                 "manageScim": false // Not supported (Not AGPLv3 Licensed)
         });
 
-        // https://github.com/bitwarden/server/blob/13d1e74d6960cf0d042620b72d85bf583a4236f7/src/Api/Models/Response/ProfileOrganizationResponseModel.cs
+        // https://github.com/bitwarden/server/blob/9ebe16587175b1c0e9208f84397bb75d0d595510/src/Api/AdminConsole/Models/Response/ProfileOrganizationResponseModel.cs
         json!({
             "id": self.org_uuid,
             "identifier": null, // Not supported
@@ -435,6 +495,8 @@ impl Membership {
             "usePasswordManager": true,
             "useCustomPermissions": true,
             "useActivateAutofillPolicy": false,
+            "useAdminSponsoredFamilies": false,
+            "useRiskInsights": false, // Not supported (Not AGPLv3 Licensed)
 
             "organizationUserId": self.uuid,
             "providerId": null,
@@ -442,7 +504,6 @@ impl Membership {
             "providerType": null,
             "familySponsorshipFriendlyName": null,
             "familySponsorshipAvailable": false,
-            "planProductType": 3,
             "productTierType": 3, // Enterprise tier
             "keyConnectorEnabled": false,
             "keyConnectorUrl": null,
@@ -450,11 +511,12 @@ impl Membership {
             "familySponsorshipValidUntil": null,
             "familySponsorshipToDelete": null,
             "accessSecretsManager": false,
-            "limitCollectionCreation": true,
-            "limitCollectionCreationDeletion": true,
+            "limitCollectionCreation": self.atype < MembershipType::Manager, // If less then a manager return true, to limit collection creations
             "limitCollectionDeletion": true,
+            "limitItemDeletion": false,
             "allowAdminAccessToAllCollectionItems": true,
             "userIsManagedByOrganization": false, // Means not managed via the Members UI, like SSO
+            "userIsClaimedByOrganization": false, // The new key instead of the obsolete userIsManagedByOrganization
 
             "permissions": permissions,
 
@@ -503,7 +565,7 @@ impl Membership {
             CONFIG.org_groups_enabled() && Group::is_in_full_access_group(&self.user_uuid, &self.org_uuid, conn).await;
 
         // If collections are to be included, only include them if the user does not have full access via a group or defined to the user it self
-        let collections: Vec<Value> = if include_collections && !(full_access_group || self.has_full_access()) {
+        let collections: Vec<Value> = if include_collections && !(full_access_group || self.access_all) {
             // Get all collections for the user here already to prevent more queries
             let cu: HashMap<CollectionId, CollectionUser> =
                 CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
@@ -600,6 +662,8 @@ impl Membership {
             "permissions": permissions,
 
             "ssoBound": false, // Not supported
+            "managedByOrganization": false, // This key is obsolete replaced by claimedByOrganization
+            "claimedByOrganization": false, // Means not managed via the Members UI, like SSO
             "usesKeyConnector": false, // Not supported
             "accessSecretsManager": false, // Not supported (Not AGPLv3 Licensed)
 
@@ -808,6 +872,19 @@ impl Membership {
         }}
     }
 
+    // Should be used only when email are disabled.
+    // In Organizations::send_invite status is set to Accepted only if the user has a password.
+    pub async fn accept_user_invitations(user_uuid: &UserId, conn: &mut DbConn) -> EmptyResult {
+        db_run! { conn: {
+            diesel::update(users_organizations::table)
+                .filter(users_organizations::user_uuid.eq(user_uuid))
+                .filter(users_organizations::status.eq(MembershipStatus::Invited as i32))
+                .set(users_organizations::status.eq(MembershipStatus::Accepted as i32))
+                .execute(conn)
+                .map_res("Error confirming invitations")
+        }}
+    }
+
     pub async fn find_any_state_by_user(user_uuid: &UserId, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             users_organizations::table
@@ -842,6 +919,21 @@ impl Membership {
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+                .load::<MembershipDb>(conn)
+                .unwrap_or_default().from_db()
+        }}
+    }
+
+    // Get all users which are either owner or admin, or a manager which can manage/access all
+    pub async fn find_confirmed_and_manage_all_by_org(org_uuid: &OrganizationId, conn: &mut DbConn) -> Vec<Self> {
+        db_run! { conn: {
+            users_organizations::table
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
+                .filter(
+                    users_organizations::atype.eq_any(vec![MembershipType::Owner as i32, MembershipType::Admin as i32])
+                    .or(users_organizations::atype.eq(MembershipType::Manager as i32).and(users_organizations::access_all.eq(true)))
+                )
                 .load::<MembershipDb>(conn)
                 .unwrap_or_default().from_db()
         }}
@@ -1067,6 +1159,17 @@ impl Membership {
                 .and(users_organizations::org_uuid.eq(org_uuid))
             )
             .first::<MembershipDb>(conn).ok().from_db()
+        }}
+    }
+
+    pub async fn find_main_user_org(user_uuid: &str, conn: &mut DbConn) -> Option<Self> {
+        db_run! { conn: {
+            users_organizations::table
+                .filter(users_organizations::user_uuid.eq(user_uuid))
+                .filter(users_organizations::status.ne(MembershipStatus::Revoked as i32))
+                .order(users_organizations::atype.asc())
+                .first::<MembershipDb>(conn)
+                .ok().from_db()
         }}
     }
 }
