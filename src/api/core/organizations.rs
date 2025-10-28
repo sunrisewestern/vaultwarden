@@ -105,6 +105,7 @@ pub fn routes() -> Vec<Route> {
         api_key,
         rotate_api_key,
         get_billing_metadata,
+        get_billing_warnings,
         get_auto_enroll_status,
     ]
 }
@@ -339,7 +340,7 @@ async fn get_user_collections(headers: Headers, mut conn: DbConn) -> Json<Value>
 }
 
 // Called during the SSO enrollment
-// The `identifier` should be the value returned by `get_org_domain_sso_details`
+// The `identifier` should be the value returned by `get_org_domain_sso_verified`
 // The returned `Id` will then be passed to `get_master_password_policy` which will mainly ignore it
 #[get("/organizations/<identifier>/auto-enroll-status")]
 async fn get_auto_enroll_status(identifier: &str, headers: Headers, mut conn: DbConn) -> JsonResult {
@@ -349,14 +350,16 @@ async fn get_auto_enroll_status(identifier: &str, headers: Headers, mut conn: Db
             None => None,
         }
     } else {
-        Organization::find_by_name(identifier, &mut conn).await
+        Organization::find_by_uuid(&identifier.into(), &mut conn).await
     };
 
     let (id, identifier, rp_auto_enroll) = match org {
         None => (get_uuid(), identifier.to_string(), false),
-        Some(org) => {
-            (org.uuid.to_string(), org.name, OrgPolicy::org_is_reset_password_auto_enroll(&org.uuid, &mut conn).await)
-        }
+        Some(org) => (
+            org.uuid.to_string(),
+            org.uuid.to_string(),
+            OrgPolicy::org_is_reset_password_auto_enroll(&org.uuid, &mut conn).await,
+        ),
     };
 
     Ok(Json(json!({
@@ -977,17 +980,17 @@ async fn get_org_domain_sso_verified(data: Json<OrgDomainDetails>, mut conn: DbC
     let identifiers = match Organization::find_org_user_email(&data.email, &mut conn)
         .await
         .into_iter()
-        .map(|o| o.name)
-        .collect::<Vec<String>>()
+        .map(|o| (o.name, o.uuid.to_string()))
+        .collect::<Vec<(String, String)>>()
     {
         v if !v.is_empty() => v,
-        _ => vec![crate::sso::FAKE_IDENTIFIER.to_string()],
+        _ => vec![(crate::sso::FAKE_IDENTIFIER.to_string(), crate::sso::FAKE_IDENTIFIER.to_string())],
     };
 
     Ok(Json(json!({
         "object": "list",
-        "data": identifiers.into_iter().map(|identifier| json!({
-            "organizationName": identifier,     // appear unused
+        "data": identifiers.into_iter().map(|(name, identifier)| json!({
+            "organizationName": name,           // appear unused
             "organizationIdentifier": identifier,
             "domainName": CONFIG.domain(),      // appear unused
         })).collect::<Vec<Value>>()
@@ -2271,6 +2274,16 @@ fn get_plans_tax_rates(_headers: Headers) -> Json<Value> {
 fn get_billing_metadata(_org_id: OrganizationId, _headers: Headers) -> Json<Value> {
     // Prevent a 404 error, which also causes Javascript errors.
     Json(_empty_data_json())
+}
+
+#[get("/organizations/<_org_id>/billing/vnext/warnings")]
+fn get_billing_warnings(_org_id: OrganizationId, _headers: Headers) -> Json<Value> {
+    Json(json!({
+        "freeTrial":null,
+        "inactiveSubscription":null,
+        "resellerRenewal":null,
+        "taxId":null,
+    }))
 }
 
 fn _empty_data_json() -> Value {
