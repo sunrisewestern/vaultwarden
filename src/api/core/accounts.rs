@@ -66,6 +66,7 @@ pub fn routes() -> Vec<rocket::Route> {
         put_device_token,
         put_clear_device_token,
         post_clear_device_token,
+        get_tasks,
         post_auth_request,
         get_auth_request,
         put_auth_request,
@@ -75,12 +76,16 @@ pub fn routes() -> Vec<rocket::Route> {
     ]
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct KDFData {
+    #[serde(alias = "kdfType")]
     kdf: i32,
+    #[serde(alias = "iterations")]
     kdf_iterations: i32,
+    #[serde(alias = "memory")]
     kdf_memory: Option<i32>,
+    #[serde(alias = "parallelism")]
     kdf_parallelism: Option<i32>,
 }
 
@@ -285,7 +290,7 @@ pub async fn _register(data: Json<RegisterData>, email_verification: bool, conn:
                 || CONFIG.is_signup_allowed(&email)
                 || pending_emergency_access.is_some()
             {
-                User::new(email.clone(), None)
+                User::new(&email, None)
             } else {
                 err!("Registration not allowed or user already exists")
             }
@@ -295,7 +300,7 @@ pub async fn _register(data: Json<RegisterData>, email_verification: bool, conn:
     // Make sure we don't leave a lingering invitation.
     Invitation::take(&email, &conn).await;
 
-    set_kdf_data(&mut user, data.kdf)?;
+    set_kdf_data(&mut user, &data.kdf)?;
 
     user.set_password(&data.master_password_hash, Some(data.key), true, None);
     user.password_hint = password_hint;
@@ -358,7 +363,7 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
     let password_hint = clean_password_hint(&data.master_password_hint);
     enforce_password_hint_setting(&password_hint)?;
 
-    set_kdf_data(&mut user, data.kdf)?;
+    set_kdf_data(&mut user, &data.kdf)?;
 
     user.set_password(
         &data.master_password_hash,
@@ -374,7 +379,7 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
     }
 
     if let Some(identifier) = data.org_identifier {
-        if identifier != crate::sso::FAKE_IDENTIFIER {
+        if identifier != crate::sso::FAKE_IDENTIFIER && identifier != crate::api::admin::FAKE_ADMIN_UUID {
             let org = match Organization::find_by_uuid(&identifier.into(), &conn).await {
                 None => err!("Failed to retrieve the associated organization"),
                 Some(org) => org,
@@ -401,8 +406,8 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
     user.save(&conn).await?;
 
     Ok(Json(json!({
-      "Object": "set-password",
-      "CaptchaBypassToken": "",
+      "object": "set-password",
+      "captchaBypassToken": "",
     })))
 }
 
@@ -545,18 +550,7 @@ async fn post_password(data: Json<ChangePassData>, headers: Headers, conn: DbCon
     save_result
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChangeKdfData {
-    #[serde(flatten)]
-    kdf: KDFData,
-
-    master_password_hash: String,
-    new_master_password_hash: String,
-    key: String,
-}
-
-fn set_kdf_data(user: &mut User, data: KDFData) -> EmptyResult {
+fn set_kdf_data(user: &mut User, data: &KDFData) -> EmptyResult {
     if data.kdf == UserKdfType::Pbkdf2 as i32 && data.kdf_iterations < 100_000 {
         err!("PBKDF2 KDF iterations must be at least 100000.")
     }
@@ -591,18 +585,61 @@ fn set_kdf_data(user: &mut User, data: KDFData) -> EmptyResult {
     Ok(())
 }
 
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthenticationData {
+    salt: String,
+    kdf: KDFData,
+    master_password_authentication_hash: String,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnlockData {
+    salt: String,
+    kdf: KDFData,
+    master_key_wrapped_user_key: String,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangeKdfData {
+    new_master_password_hash: String,
+    key: String,
+    authentication_data: AuthenticationData,
+    unlock_data: UnlockData,
+    master_password_hash: String,
+}
+
 #[post("/accounts/kdf", data = "<data>")]
 async fn post_kdf(data: Json<ChangeKdfData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     let data: ChangeKdfData = data.into_inner();
-    let mut user = headers.user;
 
-    if !user.check_valid_password(&data.master_password_hash) {
+    if !headers.user.check_valid_password(&data.master_password_hash) {
         err!("Invalid password")
     }
 
-    set_kdf_data(&mut user, data.kdf)?;
+    if data.authentication_data.kdf != data.unlock_data.kdf {
+        err!("KDF settings must be equal for authentication and unlock")
+    }
 
-    user.set_password(&data.new_master_password_hash, Some(data.key), true, None);
+    if headers.user.email != data.authentication_data.salt || headers.user.email != data.unlock_data.salt {
+        err!("Invalid master password salt")
+    }
+
+    let mut user = headers.user;
+
+    set_kdf_data(&mut user, &data.unlock_data.kdf)?;
+
+    user.set_password(
+        &data.authentication_data.master_password_authentication_hash,
+        Some(data.unlock_data.master_key_wrapped_user_key),
+        true,
+        None,
+    );
     let save_result = user.save(&conn).await;
 
     nt.send_logout(&user, Some(headers.device.uuid.clone()), &conn).await;
@@ -780,7 +817,7 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
 
     let mut existing_ciphers = Cipher::find_owned_by_user(user_id, &conn).await;
     let mut existing_folders = Folder::find_by_user(user_id, &conn).await;
-    let mut existing_emergency_access = EmergencyAccess::find_all_by_grantor_uuid(user_id, &conn).await;
+    let mut existing_emergency_access = EmergencyAccess::find_all_confirmed_by_grantor_uuid(user_id, &conn).await;
     let mut existing_memberships = Membership::find_by_user(user_id, &conn).await;
     // We only rotate the reset password key if it is set.
     existing_memberships.retain(|m| m.reset_password_key.is_some());
@@ -1279,10 +1316,11 @@ async fn rotate_api_key(data: Json<PasswordOrOtpData>, headers: Headers, conn: D
 
 #[get("/devices/knowndevice")]
 async fn get_known_device(device: KnownDevice, conn: DbConn) -> JsonResult {
-    let mut result = false;
-    if let Some(user) = User::find_by_mail(&device.email, &conn).await {
-        result = Device::find_by_uuid_and_user(&device.uuid, &user.uuid, &conn).await.is_some();
-    }
+    let result = if let Some(user) = User::find_by_mail(&device.email, &conn).await {
+        Device::find_by_uuid_and_user(&device.uuid, &user.uuid, &conn).await.is_some()
+    } else {
+        false
+    };
     Ok(Json(json!(result)))
 }
 
@@ -1372,7 +1410,7 @@ async fn put_device_token(device_id: DeviceId, data: Json<PushToken>, headers: H
     }
 
     device.push_token = Some(token);
-    if let Err(e) = device.save(&conn).await {
+    if let Err(e) = device.save(true, &conn).await {
         err!(format!("An error occurred while trying to save the device push token: {e}"));
     }
 
@@ -1406,6 +1444,14 @@ async fn put_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResul
 #[post("/devices/identifier/<device_id>/clear-token")]
 async fn post_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResult {
     put_clear_device_token(device_id, conn).await
+}
+
+#[get("/tasks")]
+fn get_tasks(_client_headers: ClientHeaders) -> JsonResult {
+    Ok(Json(json!({
+        "data": [],
+        "object": "list"
+    })))
 }
 
 #[derive(Debug, Deserialize)]

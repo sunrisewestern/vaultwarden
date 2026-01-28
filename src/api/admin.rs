@@ -1,17 +1,16 @@
-use once_cell::sync::Lazy;
-use reqwest::Method;
-use serde::de::DeserializeOwned;
-use serde_json::Value;
-use std::env;
+use std::{env, sync::LazyLock};
 
-use rocket::serde::json::Json;
+use reqwest::Method;
 use rocket::{
     form::Form,
     http::{Cookie, CookieJar, MediaType, SameSite, Status},
     request::{FromRequest, Outcome, Request},
     response::{content::RawHtml as Html, Redirect},
+    serde::json::Json,
     Catcher, Route,
 };
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 use crate::{
     api::{
@@ -24,7 +23,7 @@ use crate::{
         backup_sqlite, get_sql_server_version,
         models::{
             Attachment, Cipher, Collection, Device, Event, EventType, Group, Invitation, Membership, MembershipId,
-            MembershipType, OrgPolicy, OrgPolicyErr, Organization, OrganizationId, SsoUser, TwoFactor, User, UserId,
+            MembershipType, OrgPolicy, Organization, OrganizationId, SsoUser, TwoFactor, User, UserId,
         },
         DbConn, DbConnType, ACTIVE_DB_TYPE,
     },
@@ -32,7 +31,7 @@ use crate::{
     http_client::make_http_request,
     mail,
     util::{
-        container_base_image, format_naive_datetime_local, get_display_size, get_web_vault_version,
+        container_base_image, format_naive_datetime_local, get_active_web_release, get_display_size,
         is_running_in_container, NumberOrString,
     },
     CONFIG, VERSION,
@@ -82,7 +81,7 @@ pub fn catchers() -> Vec<Catcher> {
     }
 }
 
-static DB_TYPE: Lazy<&str> = Lazy::new(|| match ACTIVE_DB_TYPE.get() {
+static DB_TYPE: LazyLock<&str> = LazyLock::new(|| match ACTIVE_DB_TYPE.get() {
     #[cfg(mysql)]
     Some(DbConnType::Mysql) => "MySQL",
     #[cfg(postgresql)]
@@ -93,9 +92,10 @@ static DB_TYPE: Lazy<&str> = Lazy::new(|| match ACTIVE_DB_TYPE.get() {
 });
 
 #[cfg(sqlite)]
-static CAN_BACKUP: Lazy<bool> = Lazy::new(|| ACTIVE_DB_TYPE.get().map(|t| *t == DbConnType::Sqlite).unwrap_or(false));
+static CAN_BACKUP: LazyLock<bool> =
+    LazyLock::new(|| ACTIVE_DB_TYPE.get().map(|t| *t == DbConnType::Sqlite).unwrap_or(false));
 #[cfg(not(sqlite))]
-static CAN_BACKUP: Lazy<bool> = Lazy::new(|| false);
+static CAN_BACKUP: LazyLock<bool> = LazyLock::new(|| false);
 
 #[get("/")]
 fn admin_disabled() -> &'static str {
@@ -157,10 +157,10 @@ fn admin_login(request: &Request<'_>) -> ApiResult<Html<String>> {
         err_code!("Authorization failed.", Status::Unauthorized.code);
     }
     let redirect = request.segments::<std::path::PathBuf>(0..).unwrap_or_default().display().to_string();
-    render_admin_login(None, Some(redirect))
+    render_admin_login(None, Some(&redirect))
 }
 
-fn render_admin_login(msg: Option<&str>, redirect: Option<String>) -> ApiResult<Html<String>> {
+fn render_admin_login(msg: Option<&str>, redirect: Option<&str>) -> ApiResult<Html<String>> {
     // If there is an error, show it
     let msg = msg.map(|msg| format!("Error: {msg}"));
     let json = json!({
@@ -194,14 +194,17 @@ fn post_admin_login(
     if crate::ratelimit::check_limit_admin(&ip.ip).is_err() {
         return Err(AdminResponse::TooManyRequests(render_admin_login(
             Some("Too many requests, try again later."),
-            redirect,
+            redirect.as_deref(),
         )));
     }
 
     // If the token is invalid, redirect to login page
     if !_validate_token(&data.token) {
         error!("Invalid admin token. IP: {}", ip.ip);
-        Err(AdminResponse::Unauthorized(render_admin_login(Some("Invalid admin token, please try again."), redirect)))
+        Err(AdminResponse::Unauthorized(render_admin_login(
+            Some("Invalid admin token, please try again."),
+            redirect.as_deref(),
+        )))
     } else {
         // If the token received is valid, generate JWT and save it as a cookie
         let claims = generate_admin_claims();
@@ -308,7 +311,7 @@ async fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -
         err_code!("User already exists", Status::Conflict.code)
     }
 
-    let mut user = User::new(data.email, None);
+    let mut user = User::new(&data.email, None);
 
     async fn _generate_invite(user: &User, conn: &DbConn) -> EmptyResult {
         if CONFIG.mail_enabled() {
@@ -553,23 +556,9 @@ async fn update_membership_type(data: Json<MembershipTypeData>, token: AdminToke
         }
     }
 
+    member_to_edit.atype = new_type;
     // This check is also done at api::organizations::{accept_invite, _confirm_invite, _activate_member, edit_member}, update_membership_type
-    // It returns different error messages per function.
-    if new_type < MembershipType::Admin {
-        match OrgPolicy::is_user_allowed(&member_to_edit.user_uuid, &member_to_edit.org_uuid, true, &conn).await {
-            Ok(_) => {}
-            Err(OrgPolicyErr::TwoFactorMissing) => {
-                if CONFIG.email_2fa_auto_fallback() {
-                    two_factor::email::find_and_activate_email_2fa(&member_to_edit.user_uuid, &conn).await?;
-                } else {
-                    err!("You cannot modify this user to this type because they have not setup 2FA");
-                }
-            }
-            Err(OrgPolicyErr::SingleOrgEnforced) => {
-                err!("You cannot modify this user to this type because it is a member of an organization which forbids it");
-            }
-        }
-    }
+    OrgPolicy::check_user_allowed(&member_to_edit, "modify", &conn).await?;
 
     log_event(
         EventType::OrganizationUserUpdated as i32,
@@ -582,7 +571,6 @@ async fn update_membership_type(data: Json<MembershipTypeData>, token: AdminToke
     )
     .await;
 
-    member_to_edit.atype = new_type;
     member_to_edit.save(&conn).await
 }
 
@@ -701,6 +689,26 @@ async fn get_ntp_time(has_http_access: bool) -> String {
     String::from("Unable to fetch NTP time.")
 }
 
+fn web_vault_compare(active: &str, latest: &str) -> i8 {
+    use semver::Version;
+    use std::cmp::Ordering;
+
+    let active_semver = Version::parse(active).unwrap_or_else(|e| {
+        warn!("Unable to parse active web-vault version '{active}': {e}");
+        Version::parse("2025.1.1").unwrap()
+    });
+    let latest_semver = Version::parse(latest).unwrap_or_else(|e| {
+        warn!("Unable to parse latest web-vault version '{latest}': {e}");
+        Version::parse("2025.1.1").unwrap()
+    });
+
+    match active_semver.cmp(&latest_semver) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }
+}
+
 #[get("/diagnostics")]
 async fn diagnostics(_token: AdminToken, ip_header: IpHeader, conn: DbConn) -> ApiResult<Html<String>> {
     use chrono::prelude::*;
@@ -720,32 +728,21 @@ async fn diagnostics(_token: AdminToken, ip_header: IpHeader, conn: DbConn) -> A
         _ => "Unable to resolve domain name.".to_string(),
     };
 
-    let (latest_release, latest_commit, latest_web_build) = get_release_info(has_http_access).await;
+    let (latest_vw_release, latest_vw_commit, latest_web_release) = get_release_info(has_http_access).await;
+    let active_web_release = get_active_web_release();
+    let web_vault_compare = web_vault_compare(&active_web_release, &latest_web_release);
 
     let ip_header_name = &ip_header.0.unwrap_or_default();
-
-    // Get current running versions
-    let web_vault_version = get_web_vault_version();
-
-    // Check if the running version is newer than the latest stable released version
-    let web_vault_pre_release = if let Ok(web_ver_match) = semver::VersionReq::parse(&format!(">{latest_web_build}")) {
-        web_ver_match.matches(
-            &semver::Version::parse(&web_vault_version).unwrap_or_else(|_| semver::Version::parse("2025.1.1").unwrap()),
-        )
-    } else {
-        error!("Unable to parse latest_web_build: '{latest_web_build}'");
-        false
-    };
 
     let diagnostics_json = json!({
         "dns_resolved": dns_resolved,
         "current_release": VERSION,
-        "latest_release": latest_release,
-        "latest_commit": latest_commit,
+        "latest_release": latest_vw_release,
+        "latest_commit": latest_vw_commit,
         "web_vault_enabled": &CONFIG.web_vault_enabled(),
-        "web_vault_version": web_vault_version,
-        "latest_web_build": latest_web_build,
-        "web_vault_pre_release": web_vault_pre_release,
+        "active_web_release": active_web_release,
+        "latest_web_release": latest_web_release,
+        "web_vault_compare": web_vault_compare,
         "running_within_container": running_within_container,
         "container_base_image": if running_within_container { container_base_image() } else { "Not applicable" },
         "has_http_access": has_http_access,
@@ -825,11 +822,7 @@ impl<'r> FromRequest<'r> for AdminToken {
             _ => err_handler!("Error getting Client IP"),
         };
 
-        if CONFIG.disable_admin_token() {
-            Outcome::Success(Self {
-                ip,
-            })
-        } else {
+        if !CONFIG.disable_admin_token() {
             let cookies = request.cookies();
 
             let access_token = match cookies.get(COOKIE_NAME) {
@@ -853,10 +846,39 @@ impl<'r> FromRequest<'r> for AdminToken {
                 error!("Invalid or expired admin JWT. IP: {}.", &ip.ip);
                 return Outcome::Error((Status::Unauthorized, "Session expired"));
             }
-
-            Outcome::Success(Self {
-                ip,
-            })
         }
+
+        Outcome::Success(Self {
+            ip,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_web_vault_compare() {
+        // web_vault_compare(active, latest)
+        // Test normal versions
+        assert!(web_vault_compare("2025.12.0", "2025.12.1") == -1);
+        assert!(web_vault_compare("2025.12.1", "2025.12.1") == 0);
+        assert!(web_vault_compare("2025.12.2", "2025.12.1") == 1);
+
+        // Test patched/+build.n versions
+        // Newer latest version
+        assert!(web_vault_compare("2025.12.0+build.1", "2025.12.1") == -1);
+        assert!(web_vault_compare("2025.12.1", "2025.12.1+build.1") == -1);
+        assert!(web_vault_compare("2025.12.0+build.1", "2025.12.1+build.1") == -1);
+        assert!(web_vault_compare("2025.12.1+build.1", "2025.12.1+build.2") == -1);
+        // Equal versions
+        assert!(web_vault_compare("2025.12.1+build.1", "2025.12.1+build.1") == 0);
+        assert!(web_vault_compare("2025.12.2+build.2", "2025.12.2+build.2") == 0);
+        // Newer active version
+        assert!(web_vault_compare("2025.12.1+build.1", "2025.12.1") == 1);
+        assert!(web_vault_compare("2025.12.2", "2025.12.1+build.1") == 1);
+        assert!(web_vault_compare("2025.12.2+build.1", "2025.12.1+build.1") == 1);
+        assert!(web_vault_compare("2025.12.1+build.3", "2025.12.1+build.2") == 1);
     }
 }

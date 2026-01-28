@@ -1,4 +1,4 @@
-use crate::db::schema::{devices, invitations, sso_users, users};
+use crate::db::schema::{invitations, sso_users, twofactor_incomplete, users};
 use chrono::{NaiveDateTime, TimeDelta, Utc};
 use derive_more::{AsRef, Deref, Display, From};
 use diesel::prelude::*;
@@ -10,8 +10,7 @@ use super::{
 use crate::{
     api::EmptyResult,
     crypto,
-    db::models::DeviceId,
-    db::DbConn,
+    db::{models::DeviceId, DbConn},
     error::MapResult,
     sso::OIDCIdentifier,
     util::{format_date, get_uuid, retry},
@@ -106,7 +105,7 @@ impl User {
     pub const CLIENT_KDF_TYPE_DEFAULT: i32 = UserKdfType::Pbkdf2 as i32;
     pub const CLIENT_KDF_ITER_DEFAULT: i32 = 600_000;
 
-    pub fn new(email: String, name: Option<String>) -> Self {
+    pub fn new(email: &str, name: Option<String>) -> Self {
         let now = Utc::now().naive_utc();
         let email = email.to_lowercase();
 
@@ -231,6 +230,15 @@ impl User {
     /// Resets the stamp_exception to prevent re-use of the previous security-stamp
     pub fn reset_stamp_exception(&mut self) {
         self.stamp_exception = None;
+    }
+
+    pub fn display_name(&self) -> &str {
+        // default to email if name is empty
+        if !&self.name.is_empty() {
+            &self.name
+        } else {
+            &self.email
+        }
     }
 }
 
@@ -387,15 +395,18 @@ impl User {
         }}
     }
 
-    pub async fn find_by_device_id(device_uuid: &DeviceId, conn: &DbConn) -> Option<Self> {
-        db_run! { conn: {
-            users::table
-                .inner_join(devices::table.on(devices::user_uuid.eq(users::uuid)))
-                .filter(devices::uuid.eq(device_uuid))
-                .select(users::all_columns)
-                .first::<Self>(conn)
+    pub async fn find_by_device_for_email2fa(device_uuid: &DeviceId, conn: &DbConn) -> Option<Self> {
+        if let Some(user_uuid) = db_run! ( conn: {
+            twofactor_incomplete::table
+                .filter(twofactor_incomplete::device_uuid.eq(device_uuid))
+                .order_by(twofactor_incomplete::login_time.desc())
+                .select(twofactor_incomplete::user_uuid)
+                .first::<UserId>(conn)
                 .ok()
-        }}
+        }) {
+            return Self::find_by_uuid(&user_uuid, conn).await;
+        }
+        None
     }
 
     pub async fn get_all(conn: &DbConn) -> Vec<(Self, Option<SsoUser>)> {
