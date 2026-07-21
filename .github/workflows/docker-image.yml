@@ -11,10 +11,19 @@ on:
 permissions:
   contents: read
 
+env:
+  CONTAINER_REGISTRY: sunrisewestern/vaultwarden
+
 jobs:
-  push_to_registry:
-    name: Push Docker images to Docker Hub
-    runs-on: ubuntu-24.04
+  build:
+    name: Build Debian image (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
     steps:
       - name: Check out the repo
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -22,19 +31,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Determine image tags
+      - name: Determine source version
         env:
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           if [[ "${EVENT_NAME}" == "release" ]]; then
-            echo "BASE_TAGS=latest,${RELEASE_TAG}" >> "${GITHUB_ENV}"
             echo "VW_VERSION=${RELEASE_TAG}" >> "${GITHUB_ENV}"
-          else
-            echo "BASE_TAGS=testing" >> "${GITHUB_ENV}"
-            if ! git describe --tags --abbrev=0 >/dev/null 2>&1; then
-              echo "VW_VERSION=${GITHUB_SHA:0:8}" >> "${GITHUB_ENV}"
-            fi
+          elif ! git describe --tags --abbrev=0 >/dev/null 2>&1; then
+            echo "VW_VERSION=${GITHUB_SHA:0:8}" >> "${GITHUB_ENV}"
           fi
 
       - name: Log in to Docker Hub
@@ -43,25 +48,103 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
-        with:
-          platforms: arm64
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
           cache-binary: false
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
           driver-opts: network=host
 
-      - name: Build and push Docker images
+      - name: Build and push image by digest
         env:
-          BASE_TAGS: ${{ env.BASE_TAGS }}
-          CONTAINER_REGISTRIES: sunrisewestern/vaultwarden
+          MATRIX_ARCH: ${{ matrix.arch }}
           SOURCE_COMMIT: ${{ github.sha }}
           SOURCE_REPOSITORY_URL: https://github.com/${{ github.repository }}
         run: |
           docker/bake.sh \
-            --set "*.cache-from=type=gha" \
-            --set "*.cache-to=type=gha,mode=max" \
+            --set "*.cache-from=type=gha,scope=debian-${MATRIX_ARCH}" \
+            --set "*.cache-to=type=gha,scope=debian-${MATRIX_ARCH},mode=max" \
+            --set "debian-amd64-arm64.platform=linux/${MATRIX_ARCH}" \
+            --set "debian-amd64-arm64.tags=${CONTAINER_REGISTRY}" \
+            --set "debian-amd64-arm64.output=type=image,push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file "${RUNNER_TEMP}/metadata.json" \
             debian-amd64-arm64
+
+      - name: Export image digest
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          DIGEST="$(jq -r '."debian-amd64-arm64"."containerimage.digest"' "${RUNNER_TEMP}/metadata.json")"
+          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid image digest: ${DIGEST}"
+            exit 1
+          fi
+
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge and push Docker manifest
+    runs-on: ubuntu-24.04
+    needs: build
+
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Determine image tags
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ "${EVENT_NAME}" == "release" ]]; then
+            echo "IMAGE_TAGS=latest,${RELEASE_TAG}" >> "${GITHUB_ENV}"
+          else
+            echo "IMAGE_TAGS=testing" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Create and push manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE_TAGS: ${{ env.IMAGE_TAGS }}
+        run: |
+          IFS=',' read -ra TAGS <<< "${IMAGE_TAGS}"
+          TAG_ARGS=()
+          for tag in "${TAGS[@]}"; do
+            TAG_ARGS+=("-t" "${CONTAINER_REGISTRY}:${tag}")
+          done
+
+          shopt -s nullglob
+          DIGEST_FILES=(*)
+          if (( ${#DIGEST_FILES[@]} != 2 )); then
+            echo "Expected two image digests, found ${#DIGEST_FILES[@]}"
+            exit 1
+          fi
+
+          SOURCE_ARGS=()
+          for digest in "${DIGEST_FILES[@]}"; do
+            SOURCE_ARGS+=("${CONTAINER_REGISTRY}@sha256:${digest}")
+          done
+
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCE_ARGS[@]}"
+          docker buildx imagetools inspect "${CONTAINER_REGISTRY}:${TAGS[0]}"
