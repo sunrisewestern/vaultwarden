@@ -8,42 +8,60 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   push_to_registry:
-    name: Push Docker image to Docker Hub
-    runs-on: ubuntu-latest
+    name: Push Docker images to Docker Hub
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine image tags
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ "${EVENT_NAME}" == "release" ]]; then
+            echo "BASE_TAGS=latest,${RELEASE_TAG}" >> "${GITHUB_ENV}"
+            echo "VW_VERSION=${RELEASE_TAG}" >> "${GITHUB_ENV}"
+          else
+            echo "BASE_TAGS=testing" >> "${GITHUB_ENV}"
+            if ! git describe --tags --abbrev=0 >/dev/null 2>&1; then
+              echo "VW_VERSION=${GITHUB_SHA:0:8}" >> "${GITHUB_ENV}"
+            fi
+          fi
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v4
-        with:
-          images: sunrisewestern/vaultwarden
-          tags: |
-            type=raw,value=latest
-            type=ref,event=tag
-
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64,arm
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-binary: false
+          driver-opts: network=host
+
+      - name: Build and push Docker images
+        env:
+          BASE_TAGS: ${{ env.BASE_TAGS }}
+          CONTAINER_REGISTRIES: sunrisewestern/vaultwarden
+          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_REPOSITORY_URL: https://github.com/${{ github.repository }}
+        run: |
+          docker/bake.sh \
+            --set "*.cache-from=type=gha" \
+            --set "*.cache-to=type=gha,mode=max" \
+            debian-multi alpine-multi
