@@ -100,6 +100,12 @@ target "debian-multi" {
   output = [join(",", flatten([["type=registry"], image_index_annotations()]))]
 }
 
+// Multi Platform target for workflows which publish amd64 and arm64 only
+target "debian-amd64-arm64" {
+  inherits = ["debian-multi"]
+  platforms = ["linux/amd64", "linux/arm64"]
+}
+
 // Per platform targets, to individually test building per platform locally
 target "debian-amd64" {
   inherits = ["debian"]
